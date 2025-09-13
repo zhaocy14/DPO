@@ -260,7 +260,7 @@ if __name__ == "__main__":
         if hostname == "net-g10":
             dir_root = '/home/ychong/data/cyzhao'
         else:
-            dir_root = '/data/cyzhao'
+            dir_root = '/data/cyzhao/collector_cydpo'
 
     # # parameter:
     batch_size = 1
