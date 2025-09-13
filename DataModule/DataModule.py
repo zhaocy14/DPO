@@ -25,10 +25,6 @@ class WalkerDataset(Dataset):
         self.predict_len = pred_len  # future length for prediction
         self.csv_dir = self.data_dir + os.path.sep + "meta.csv"
         self.csv_data = pd.read_csv(self.csv_dir)
-        self.label_list = []
-
-        self.ratio_list = [0, 0, 0, 0, 0, 0, 0]
-        self.num_list = [0, 0, 0, 0, 0, 0, 0]
 
         # if summary:
         #     self.summary()
@@ -154,10 +150,6 @@ class CombinedDataset(object):
         self.datasets_dir = dir_list
         self.frame_len = frame_len
         self.datasets_list = []
-
-        # dataset information
-        self.number_list = [0, 0, 0, 0, 0, 0, 0]
-        self.ratio_list = [0, 0, 0, 0, 0, 0, 0]
 
         # for sampler
         self.label_list = []
