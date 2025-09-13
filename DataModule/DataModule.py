@@ -185,6 +185,7 @@ class CombinedDataset(object):
 if __name__ == "__main__":
     import platform
     import socket
+    from tqdm import tqdm
 
     if platform.system().lower() == 'windows':
         print("windows")
@@ -212,7 +213,7 @@ if __name__ == "__main__":
                                    num_workers=num_workers_sampler)
     print("done!")
     time_start = time.time()
-    for img1, img2, driver, img1_fut, img2_fu, driver_fu in walker_dataloader:
-        print(img1.shape)
-        num_ratio = np.zeros((7,))
+    for img1, img2, driver, img1_fut, img2_fu, driver_fu in tqdm(walker_dataloader):
+        # print(img1.shape)
+        pass
     print("Loading data time:", time.time() - time_start)
