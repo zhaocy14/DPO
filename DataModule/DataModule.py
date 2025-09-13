@@ -140,47 +140,6 @@ class WalkerDataset(Dataset):
         print("*" * 5, "Dataset:", self.data_dir, "*" * 5)
         print("Total number:", self.__len__(), '\n')
 
-    @staticmethod
-    def calculate_label(driver_list: list) -> int:
-        """
-        driver list consist of some elements.
-        :param driver_list: the driver frames:
-        (_X, _Y, _THETA, d_l, d_r, _dX, _dY,dx,dy)
-        _X, _Y, _THETA: integral position at absolute coordinate
-        d_l, d_r: movement of left/right wheels
-        _dX, _dY: differential of position at absolute coordinate
-        dx, dy: differntial of position at walker's coordinate
-        :return:
-        the number of category:
-            0: standing still
-            1: moving forward
-            2: turning left while moving forward
-            3: turning right while moving forward
-            4: turning left on the spot
-            5: turning right on the spot
-            6: moving backward
-        """
-        label_num = 0
-        moving_threshold = 0.01
-        turning_threshold = 0.017
-        left = -driver_list[3]
-        right = -driver_list[4]
-        if abs(left) <= moving_threshold and abs(right) <= moving_threshold:
-            label_num = 0
-        elif left > moving_threshold and right > moving_threshold:
-            if abs(left - right) < turning_threshold:
-                label_num = 1
-            elif right - left >= turning_threshold:
-                label_num = 2
-            elif left - right >= turning_threshold:
-                label_num = 3
-        elif left <= 0 <= right:
-            label_num = 4
-        elif left >= 0 >= right:
-            label_num = 5
-        elif left < 0 and right < 0:
-            label_num = 6
-        return label_num
 
 
 class CombinedDataset(object):
@@ -213,9 +172,6 @@ class CombinedDataset(object):
         self.training_dataset, self.val_dataset = random_split(self.concatenated_dataset,
                                                                [self.train_len, self.val_len],
                                                                torch.Generator().manual_seed(42))
-        self.training_weighted_list = []
-        self.val_weighted_list = []
-        self.update_weighted_list()
 
         # print out sub dataset and the combined dataset information
         if show:
@@ -229,14 +185,6 @@ class CombinedDataset(object):
             self.number_list = [sum(x) for x in zip(self.number_list, self.datasets_list[i].num_list)]
             self.label_list = self.label_list + self.datasets_list[i].label_list
         self.ratio_list = [(num / self.total_sample_num) for num in self.number_list]
-
-    def update_weighted_list(self):
-        for k in range(self.total_sample_num):
-            self.weighted_list.append(1 / (self.ratio_list[self.label_list[k]]))
-        for i in range(self.train_len):
-            self.training_weighted_list.append(self.weighted_list[self.training_dataset.indices[i]])
-        for j in range(self.val_len):
-            self.val_weighted_list.append(self.weighted_list[self.val_dataset.indices[j]])
 
     def concat_dataset(self):
         return ConcatDataset(self.datasets_list)
@@ -273,11 +221,8 @@ if __name__ == "__main__":
                 dir_list.append(os.path.join(dir_root, file))
 
     con_dataset = CombinedDataset(dir_list=dir_list, frame_len=10, show=summary)
-
-    walker_sampler = WeightedRandomSampler(weights=con_dataset.val_weighted_list, num_samples=con_dataset.val_len)
-
-    walker_dataloader = DataLoader(dataset=con_dataset.val_dataset, batch_size=batch_size, shuffle=False,
-                                   sampler=walker_sampler, num_workers=num_workers_sampler)
+    walker_dataloader = DataLoader(dataset=con_dataset.val_dataset, batch_size=batch_size, shuffle=True,
+                                   num_workers=num_workers_sampler)
     print("done!")
     time_start = time.time()
     for img1, img2, driver, img1_fut, img2_fu, driver_fu in walker_dataloader:
