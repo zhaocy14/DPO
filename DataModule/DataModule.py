@@ -94,9 +94,9 @@ class WalkerDataset(Dataset):
         driver_con_tensor = torch.zeros((0,))
         for i in range(index, lens + index):
             driver_tuple = eval(self.csv_data.iloc[i, 3])
-            driver_tensor = torch.tensor(driver_tuple)
+            driver_tensor = torch.tensor(driver_tuple[-2:])
             driver_con_tensor = torch.cat(tensors=(driver_con_tensor, driver_tensor), dim=0)
-        driver_con_tensor = driver_con_tensor.view(lens, 12)
+        driver_con_tensor = driver_con_tensor.view(lens, 2)
         return driver_con_tensor
 
     def get_dual_images(self, index: int, lens: int) -> (torch.Tensor, torch.Tensor):
