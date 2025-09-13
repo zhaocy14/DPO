@@ -152,8 +152,6 @@ class CombinedDataset(object):
         self.datasets_list = []
 
         # for sampler
-        self.label_list = []
-        self.weighted_list = []
         self.total_sample_num = 0
 
         # loading dataset
@@ -174,9 +172,6 @@ class CombinedDataset(object):
             self.datasets_list.append(WalkerDataset(data_dir=directory, frame_len=self.frame_len))
         for i in range(len(self.datasets_list)):
             self.total_sample_num += self.datasets_list[i].__len__()
-            self.number_list = [sum(x) for x in zip(self.number_list, self.datasets_list[i].num_list)]
-            self.label_list = self.label_list + self.datasets_list[i].label_list
-        self.ratio_list = [(num / self.total_sample_num) for num in self.number_list]
 
     def concat_dataset(self):
         return ConcatDataset(self.datasets_list)
