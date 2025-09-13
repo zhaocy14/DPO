@@ -139,7 +139,7 @@ class WalkerDataset(Dataset):
 
 
 class CombinedDataset(object):
-    def __init__(self, dir_list: list, frame_len: int = 10, show: bool = False):
+    def __init__(self, dir_list: list, frame_len: int = 10, predict_len:int=5, show: bool = False):
         """
         Create a concatenated dataset. Achieve that by calling
         :param dir_list: the list of dataset direction
@@ -149,6 +149,7 @@ class CombinedDataset(object):
         # dataset source
         self.datasets_dir = dir_list
         self.frame_len = frame_len
+        self.predict_len = predict_len
         self.datasets_list = []
 
         # for sampler
@@ -169,7 +170,7 @@ class CombinedDataset(object):
 
     def load_dataset(self):
         for directory in self.datasets_dir:
-            self.datasets_list.append(WalkerDataset(data_dir=directory, frame_len=self.frame_len))
+            self.datasets_list.append(WalkerDataset(data_dir=directory, frame_len=self.frame_len, pred_len=self.predict_len))
         for i in range(len(self.datasets_list)):
             self.total_sample_num += self.datasets_list[i].__len__()
 
@@ -208,12 +209,26 @@ if __name__ == "__main__":
             if "2025" in file:
                 dir_list.append(os.path.join(dir_root, file))
 
-    con_dataset = CombinedDataset(dir_list=dir_list, frame_len=10, show=summary)
+    con_dataset = CombinedDataset(dir_list=dir_list, frame_len=15, predict_len=5, show=summary)
     walker_dataloader = DataLoader(dataset=con_dataset.val_dataset, batch_size=batch_size, shuffle=True,
                                    num_workers=num_workers_sampler)
     print("done!")
     time_start = time.time()
+    global_driver_min = torch.tensor([float('inf')] * 2)  # [特征1_min, 特征2_min]
+    global_driver_max = torch.tensor([-float('inf')] * 2) # [特征1_max, 特征2_max]
     for img1, img2, driver, img1_fut, img2_fu, driver_fu in tqdm(walker_dataloader):
+        driver_flatten = driver.view(-1, 2)
+
+        # 2. 计算当前 batch 内的最大/最小值（按特征维度计算，即 dim=0）
+        batch_min = driver_flatten.min(dim=0)[0]  # 每个特征的 batch 最小值
+        batch_max = driver_flatten.max(dim=0)[0]  # 每个特征的 batch 最大值
+
+        # 3. 更新全局最大/最小值（取「全局最值」和「当前 batch 最值」的极值）
+        global_driver_min = torch.min(global_driver_min, batch_min)
+        global_driver_max = torch.max(global_driver_max, batch_max)
         # print(img1.shape)
         pass
     print("Loading data time:", time.time() - time_start)
+    print("\n=== Driver 数据全局最大/最小值 ===")
+    print(f"特征1（第一个维度）: 最小值 = {global_driver_min[0].item():.6f}, 最大值 = {global_driver_max[0].item():.6f}")
+    print(f"特征2（第二个维度）: 最小值 = {global_driver_min[1].item():.6f}, 最大值 = {global_driver_max[1].item():.6f}")
