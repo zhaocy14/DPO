@@ -66,12 +66,12 @@ img_sim_model = SimilarityModelImage(
     num_layers=config['num_layers_sim'],
     nhead=config['nhead_sim'],
     similarity_dim=config['similarity_dim']
-)
+).to(device)
 
 driver_sim_model = SimilarityModelDriver(
     embed_dim=config['embed_dim_sim'],
     similarity_dim=config['similarity_dim'],
-)
+).to(device)
 
 data_root = config["data_root_dirs"]
 
