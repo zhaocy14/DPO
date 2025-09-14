@@ -145,7 +145,7 @@ def train_one_epoch(epoch):
     total_sim_loss = 0.0
     total_loss = 0.0
 
-    max_train_batches = 50  # 只训练前50个batch（按需调整）
+    max_train_batches = 100  # 只训练前50个batch（按需调整）
     batch_count = 0  # 计数当前epoch已训练的batch数
 
     pbar = tqdm(enumerate(train_loader), desc=f"训练 Epoch {epoch + 1}/{config['epochs']}",
@@ -241,10 +241,19 @@ def validate_one_epoch(epoch):
     total_sim_loss = 0.0
     total_loss = 0.0
 
+    max_train_batches = 100  # 只训练前50个batch（按需调整）
+    batch_count = 0  # 计数当前epoch已训练的batch数
+
+    pbar = tqdm(enumerate(val_loader), desc=f"验证 Epoch {epoch + 1}/{config['epochs']}",
+                total=min(max_train_batches, len(val_loader)))  # 进度条只显示到max_train_batches
     # 关闭梯度计算（加速验证，避免内存占用）
     with torch.no_grad():
-        pbar = tqdm(val_loader, desc=f"验证 Epoch {epoch + 1}/{config['epochs']}")
-        for batch in pbar:
+        for batch_idx, batch in pbar:
+            if batch_count >= max_train_batches:
+                print(f"\n已验证{max_train_batches}个batch，提前终止当前epoch")
+                break
+            batch_count += 1  # 计数+1
+
             # 1. 解包数据（与训练逻辑完全一致）
             imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
             images = torch.stack([imgs1, imgs2], dim=2).to(device)
