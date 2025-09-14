@@ -99,7 +99,7 @@ class WalkerDataset(Dataset):
             # map the driver data to [-1, 1] where -150 -> -1, 50 -> 1
             # driver_tensor = (driver_tensor - (-150.0)) / (50 - (-150)) * [1 - (-1)] + (-1)
             # simplified calculation:
-            driver_tensor = (driver_tensor - 50)/100
+            driver_tensor = (driver_tensor + 50)/100
 
             driver_con_tensor = torch.cat(tensors=(driver_con_tensor, driver_tensor), dim=0)
         driver_con_tensor = driver_con_tensor.view(lens, 2)
@@ -208,7 +208,7 @@ if __name__ == "__main__":
     # # parameter:
     batch_size = 1
     summary = True
-    num_workers_sampler = 80
+    num_workers_sampler = 60
     dir_list = []
     for file in os.listdir(dir_root):
         if os.path.isdir(os.path.join(dir_root, file)):
