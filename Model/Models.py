@@ -246,13 +246,13 @@ class SimilarityModelImage(nn.Module):
 
     def __init__(self, embed_dim=128, num_frames=30, num_layers=3, nhead=4, similarity_dim=128):
         super(SimilarityModelImage, self).__init__()
-        self.embed_dim = embed_dim
+        self.embed_dim = embed_dim * 2
         self.num_frames = num_frames
-        self.positional_encoding = PositionalEncoding(self.embed_dim*2, max_len=num_frames)
+        self.positional_encoding = PositionalEncoding(self.embed_dim, max_len=num_frames)
 
         # Transformer编码器层
         self.transformer_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim*2,
+            d_model=self.embed_dim,
             nhead=nhead,
             batch_first=True
         )
