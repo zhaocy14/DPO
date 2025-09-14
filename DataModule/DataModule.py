@@ -206,7 +206,7 @@ if __name__ == "__main__":
             dir_root = '/data/cyzhao/collector_cydpo'
 
     # # parameter:
-    batch_size = 1
+    batch_size = 16
     summary = True
     num_workers_sampler = 60
     dir_list = []
