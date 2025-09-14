@@ -22,21 +22,21 @@ print(f"使用设备: {device}")
 # 配置参数
 config = {
     # training parameters
-    "batch_size": 8,
-    "epochs": 5,
-    "lr": 1e-4,
+    "batch_size": 4,
+    "epochs": 10,
+    "lr": 1e-5,
     # "weight_decay": 1e-5,
-    "sampling_workers": 10,
+    "sampling_workers": 15,
 
     # generator model parameters
     "embed_dim_gen": 128,
     "nhead_gen": 8,
     "num_layers_gen": 16,
     "motor_dim": 2,
-    "gen_seq_len": 15,  # 观测长度
+    "gen_seq_len": 30,  # 观测长度
 
 
-    "sim_seq_len": 15,  # 预测长度
+    "sim_seq_len": 30,  # 预测长度
     "embed_dim_sim": 128,
     "num_layers_sim": 3,
     "nhead_sim": 4,
@@ -105,7 +105,7 @@ optimizer = torch.optim.Adam(params=[{'params': image_embed.parameters()},
                                       {'params': img_sim_model.parameters()},
                                       {'params': driver_sim_model.parameters()}],
                                lr=config['lr'])
-sch = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+sch = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
 
 def nll_loss(mean, std, target):
@@ -297,8 +297,8 @@ def main():
         epoch_start_time = time.time()
 
         # 1. 训练一个epoch
-        # train_total, train_gen, train_sim = train_one_epoch(epoch)
-        train_total, train_gen, train_sim = 0, 0, 0
+        train_total, train_gen, train_sim = train_one_epoch(epoch)
+        # train_total, train_gen, train_sim = 0, 0, 0
 
         # 2. 学习率调度（每个epoch后更新）
         sch.step()
