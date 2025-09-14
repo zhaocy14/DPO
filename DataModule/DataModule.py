@@ -95,6 +95,7 @@ class WalkerDataset(Dataset):
         for i in range(index, lens + index):
             driver_tuple = eval(self.csv_data.iloc[i, 3])
             driver_tensor = torch.tensor(driver_tuple[-2:])
+            driver_tensor = torch.clamp(driver_tensor, min=-100.0, max=100.0)
             driver_con_tensor = torch.cat(tensors=(driver_con_tensor, driver_tensor), dim=0)
         driver_con_tensor = driver_con_tensor.view(lens, 2)
         return driver_con_tensor
@@ -217,9 +218,7 @@ if __name__ == "__main__":
     global_driver_min = torch.tensor([float('inf')] * 2)  # [特征1_min, 特征2_min]
     global_driver_max = torch.tensor([-float('inf')] * 2) # [特征1_max, 特征2_max]
     for img1, img2, driver, img1_fut, img2_fu, driver_fu in tqdm(walker_dataloader):
-        print(driver.shape)
         driver_flatten = driver.view(-1, 2)
-        print(driver_flatten.shape)
         # 2. 计算当前 batch 内的最大/最小值（按特征维度计算，即 dim=0）
         batch_min = driver_flatten.min(dim=0)[0]  # 每个特征的 batch 最小值
         batch_max = driver_flatten.max(dim=0)[0]  # 每个特征的 batch 最大值
