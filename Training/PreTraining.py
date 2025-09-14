@@ -87,12 +87,12 @@ all_dataset = CombinedDataset(dir_list=data_dir_list,
 train_dataset = all_dataset.training_dataset
 val_dataset = all_dataset.val_dataset
 
-train_loader = DataLoader(dataset=train_dataset.concatenated_dataset,
+train_loader = DataLoader(dataset=train_dataset,
                           batch_size=config['batch_size'],
                           shuffle=True,
                           num_workers=config['sampling_workers'])
 
-val_loader = DataLoader(dataset=val_dataset.concatenated_dataset,
+val_loader = DataLoader(dataset=val_dataset,
                         batch_size=config['batch_size'],
                         shuffle=False,
                         num_workers=config['sampling_workers'])
