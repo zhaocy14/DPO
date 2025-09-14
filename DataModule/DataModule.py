@@ -95,7 +95,12 @@ class WalkerDataset(Dataset):
         for i in range(index, lens + index):
             driver_tuple = eval(self.csv_data.iloc[i, 3])
             driver_tensor = torch.tensor(driver_tuple[-2:])
-            driver_tensor = torch.clamp(driver_tensor, min=-100.0, max=100.0)
+            driver_tensor = torch.clamp(driver_tensor, min=-150.0, max=50.0)
+            # map the driver data to [-1, 1] where -150 -> -1, 50 -> 1
+            # driver_tensor = (driver_tensor - (-150.0)) / (50 - (-150)) * [1 - (-1)] + (-1)
+            # simplified calculation:
+            driver_tensor = (driver_tensor - 50)/100
+
             driver_con_tensor = torch.cat(tensors=(driver_con_tensor, driver_tensor), dim=0)
         driver_con_tensor = driver_con_tensor.view(lens, 2)
         return driver_con_tensor
