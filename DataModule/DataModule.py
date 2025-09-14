@@ -224,6 +224,8 @@ if __name__ == "__main__":
     con_dataset = CombinedDataset(dir_list=dir_list, frame_len=15, predict_len=5, show=summary)
     walker_dataloader = DataLoader(dataset=con_dataset.val_dataset, batch_size=batch_size, shuffle=True,
                                    num_workers=num_workers_sampler)
+    print(con_dataset.val_dataset.__len__())
+    print(con_dataset.training_dataset.__len__())
     print("done!")
     time_start = time.time()
     global_driver_min = torch.tensor([float('inf')] * 2)  # [特征1_min, 特征2_min]

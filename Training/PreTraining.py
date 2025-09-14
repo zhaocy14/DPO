@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset, ConcatDataset
 from DataModule.DataModule import CombinedDataset
 from Model.Models import ImageEmbedding, MotorEmbedding, EncoderOnlyCandidateGenerator, SimilarityModelImage, SimilarityModelDriver
 from tqdm import tqdm
-
+from Model.Models import calculate_model_size
 # from Training.DPOTraining import optimizer
 
 # 设置设备为第三张显卡 (cuda:2)
@@ -87,6 +87,7 @@ all_dataset = CombinedDataset(dir_list=data_dir_list,
                               show=True)
 train_dataset = all_dataset.training_dataset
 val_dataset = all_dataset.val_dataset
+print(f"训练集样本数: {len(train_dataset)} | 验证集样本数: {len(val_dataset)}")
 
 train_loader = DataLoader(dataset=train_dataset,
                           batch_size=config['batch_size'],
