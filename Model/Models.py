@@ -274,7 +274,6 @@ class SimilarityModelImage(nn.Module):
         img_embedding1: (batch_size, num_frames, embed_dim)
         输出: 投射后的特征向量 (batch_size, similarity_dim)
         """
-        print(imgs_embedding.shape)
         # 将两个图像嵌入序列拼接
         imgs_embedding = self.positional_encoding(imgs_embedding)  # 加位置编码
         # 通过Transformer编码器
