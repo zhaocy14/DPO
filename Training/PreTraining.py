@@ -33,7 +33,7 @@ config = {
     "nhead_gen": 8,
     "num_layers_gen": 16,
     "motor_dim": 2,
-    "gen_seq_len": 30,  # 观测长度
+    "gen_seq_len": 15,  # 观测长度
 
 
     "sim_seq_len": 15,  # 预测长度
