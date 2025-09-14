@@ -203,7 +203,7 @@ if __name__ == "__main__":
     # # parameter:
     batch_size = 1
     summary = True
-    num_workers_sampler = 30
+    num_workers_sampler = 50
     dir_list = []
     for file in os.listdir(dir_root):
         if os.path.isdir(os.path.join(dir_root, file)):
