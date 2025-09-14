@@ -16,7 +16,7 @@ from tqdm import tqdm
 # from Training.DPOTraining import optimizer
 
 # 设置设备为第三张显卡 (cuda:2)
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"使用设备: {device}")
 
 # 配置参数
