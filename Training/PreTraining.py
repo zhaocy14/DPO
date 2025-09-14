@@ -14,14 +14,14 @@ from Model.Models import calculate_model_size
 # from Training.DPOTraining import optimizer
 
 # 设置设备为第三张显卡 (cuda:2)
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"使用设备: {device}")
 
 # 配置参数
 config = {
     # training parameters
     "batch_size": 4,
-    "epochs": 1,
+    "epochs": 20,
     "lr": 1e-5,
     # "weight_decay": 1e-5,
     "sampling_workers": 15,
@@ -47,6 +47,7 @@ config = {
 }
 
 os.makedirs(config["save_path"], exist_ok=True)
+os.makedirs(config["loss_data_path"], exist_ok=True)
 
 # initialize models
 image_embed = ImageEmbedding(embed_dim=config["embed_dim_gen"], num_layers=3, is_resnet=False).to(device)
