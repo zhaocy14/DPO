@@ -13,7 +13,7 @@ from DataModule.DataModule import CombinedDataset
 from Model.Models import ImageEmbedding, MotorEmbedding, EncoderOnlyCandidateGenerator, SimilarityModelImage, SimilarityModelDriver
 from tqdm import tqdm
 
-from Training.DPOTraining import optimizer
+# from Training.DPOTraining import optimizer
 
 # 设置设备为第三张显卡 (cuda:2)
 device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
@@ -89,7 +89,7 @@ walker_dataloader = DataLoader(dataset=train_dataset.concatenated_dataset,
                                shuffle=True,
                                num_workers=config['sampling_workers'],)
 
-optimizer = torch.optim.AdamW(params=[{'params': image_embed.parameters()},
+optimizer = torch.optim.Adam(params=[{'params': image_embed.parameters()},
                                       {'params': motor_embed.parameters()},
                                       {'params': candidate_generator.parameters()},
                                       {'params': img_sim_model.parameters()},
