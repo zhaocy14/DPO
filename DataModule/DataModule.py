@@ -126,6 +126,7 @@ class WalkerDataset(Dataset):
                                                    [0.39859927, 0.36244579, 0.29638241])(one_img1_tensor)
             # one_img1_tensor = transforms.Normalize([0.485, 0.456, 0.406],
             #                                             [0.229, 0.224, 0.225])(one_img1_tensor)
+            one_img1_tensor = one_img1_tensor.unsqueeze(0)
             img1_tensor = torch.cat(tensors=(img1_tensor, one_img1_tensor), dim=0)
 
             # read images 2 from jpg file
@@ -137,6 +138,7 @@ class WalkerDataset(Dataset):
                                                    [0.39859927, 0.36244579, 0.29638241])(one_img2_tensor)
             # one_img2_tensor = transforms.Normalize([0.485, 0.456, 0.406],
             #                                             [0.229, 0.224, 0.225])(one_img2_tensor)
+            one_img2_tensor = one_img2_tensor.unsqueeze(0)
             img2_tensor = torch.cat(tensors=(img2_tensor, one_img2_tensor), dim=0)
 
         return img1_tensor, img2_tensor

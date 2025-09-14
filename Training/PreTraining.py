@@ -81,13 +81,21 @@ for file in os.listdir(data_root):
         if "2025" in file:
             data_dir_list.append(os.path.join(data_root, file))
 
-train_dataset = CombinedDataset(dir_list=data_dir_list,
+all_dataset = CombinedDataset(dir_list=data_dir_list,
                                 frame_len=config["gen_seq_len"],
                                 show=True)
-walker_dataloader = DataLoader(dataset=train_dataset.concatenated_dataset,
-                               batch_size=config['batch_size'],
-                               shuffle=True,
-                               num_workers=config['sampling_workers'],)
+train_dataset = all_dataset.training_dataset
+val_dataset = all_dataset.val_dataset
+
+train_loader = DataLoader(dataset=train_dataset.concatenated_dataset,
+                          batch_size=config['batch_size'],
+                          shuffle=True,
+                          num_workers=config['sampling_workers'])
+
+val_loader = DataLoader(dataset=val_dataset.concatenated_dataset,
+                        batch_size=config['batch_size'],
+                        shuffle=False,
+                        num_workers=config['sampling_workers'])
 
 optimizer = torch.optim.Adam(params=[{'params': image_embed.parameters()},
                                       {'params': motor_embed.parameters()},
@@ -136,7 +144,7 @@ def train_one_epoch(epoch):
     total_sim_loss = 0.0
     total_loss = 0.0
 
-    pbar = tqdm(walker_dataloader, desc=f"训练 Epoch {epoch + 1}/{config['epochs']}")
+    pbar = tqdm(train_loader, desc=f"训练 Epoch {epoch + 1}/{config['epochs']}")
 
     for batch in pbar:
         # 解包数据并移动到设备
