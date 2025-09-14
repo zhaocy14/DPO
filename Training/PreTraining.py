@@ -22,7 +22,7 @@ print(f"使用设备: {device}")
 # 配置参数
 config = {
     # training parameters
-    "batch_size": 16,
+    "batch_size": 8,
     "epochs": 100,
     "lr": 1e-4,
     # "weight_decay": 1e-5,
