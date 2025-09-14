@@ -82,8 +82,9 @@ for file in os.listdir(data_root):
             data_dir_list.append(os.path.join(data_root, file))
 
 all_dataset = CombinedDataset(dir_list=data_dir_list,
-                                frame_len=config["gen_seq_len"],
-                                show=True)
+                              frame_len=config["gen_seq_len"],
+                              predict_len=config['sim_seq_len'],
+                              show=True)
 train_dataset = all_dataset.training_dataset
 val_dataset = all_dataset.val_dataset
 
@@ -181,11 +182,15 @@ def train_one_epoch(epoch):
 
         # 3. 相似度学习任务
         # 未来图像嵌入
-        future_img1_emb = image_embed(future_imgs1.to(device))  # (batch, predict_len, embed_dim)
-        future_img2_emb = image_embed(future_imgs2.to(device))  # (batch, predict_len, embed_dim)
+        future_images_emb = image_embed(future_images)  # (batch, predict_len, 2*embed_dim)
+        future_imgs1_emb = future_images_emb[ :, :, 0, :]  # (batch, predict_len, embed_dim)
+        future_imgs2_emb = future_images_emb[ :, :, 1, :]  # (batch, predict_len, embed_dim)
+        print(future_imgs1_emb.shape, future_imgs2_emb.shape)
+        # future_img1_emb = image_embed(future_imgs1.to(device))  # (batch, predict_len, embed_dim)
+        # future_img2_emb = image_embed(future_imgs2.to(device))  # (batch, predict_len, embed_dim)
 
         # 对未来图像序列和当前动作进行投射
-        img_proj = img_sim_model(future_img1_emb, future_img2_emb)  # (batch, similarity_dim)
+        img_proj = img_sim_model(future_imgs1_emb, future_imgs2_emb)  # (batch, similarity_dim)
 
         # 对当前动作的最后一帧进行投射
         last_motor_embedded = motor_embedded[:, -1, :]  # (batch, embed_dim)
