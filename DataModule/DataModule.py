@@ -202,7 +202,7 @@ if __name__ == "__main__":
     # # parameter:
     batch_size = 1
     summary = True
-    num_workers_sampler = 10
+    num_workers_sampler = 30
     dir_list = []
     for file in os.listdir(dir_root):
         if os.path.isdir(os.path.join(dir_root, file)):
@@ -217,8 +217,9 @@ if __name__ == "__main__":
     global_driver_min = torch.tensor([float('inf')] * 2)  # [特征1_min, 特征2_min]
     global_driver_max = torch.tensor([-float('inf')] * 2) # [特征1_max, 特征2_max]
     for img1, img2, driver, img1_fut, img2_fu, driver_fu in tqdm(walker_dataloader):
+        print(driver.shape)
         driver_flatten = driver.view(-1, 2)
-
+        print(driver_flatten.shape)
         # 2. 计算当前 batch 内的最大/最小值（按特征维度计算，即 dim=0）
         batch_min = driver_flatten.min(dim=0)[0]  # 每个特征的 batch 最小值
         batch_max = driver_flatten.max(dim=0)[0]  # 每个特征的 batch 最大值
