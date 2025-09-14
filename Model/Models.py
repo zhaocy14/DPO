@@ -263,9 +263,9 @@ class SimilarityModelImage(nn.Module):
 
         # 全连接层，将输出映射到相似度空间
         self.fc = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 2),
+            nn.Linear(self.embed_dim, self.embed_dim // 2),
             nn.ReLU(),
-            nn.Linear(embed_dim // 2, similarity_dim)
+            nn.Linear(self.embed_dim // 2, similarity_dim)
         )
 
     def forward(self, imgs_embedding):
