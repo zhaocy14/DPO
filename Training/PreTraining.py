@@ -26,7 +26,7 @@ config = {
     "epochs": 100,
     "lr": 1e-4,
     # "weight_decay": 1e-5,
-    "sampling_workers": 15,
+    "sampling_workers": 10,
 
     # generator model parameters
     "embed_dim_gen": 128,
