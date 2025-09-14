@@ -255,8 +255,8 @@ def validate_one_epoch(epoch):
                 num_candidates=1,
                 temperature=1.0
             )
-            gen_loss1 = nll_loss(outputs['mean1'], outputs['std1'], next_driver[:, 0])
-            gen_loss2 = nll_loss(outputs['mean2'], outputs['std2'], next_driver[:, 1])
+            gen_loss1 = nll_loss(outputs['mean1'], outputs['std1'], next_driver[0]).mean()
+            gen_loss2 = nll_loss(outputs['mean2'], outputs['std2'], next_driver[1]).mean()
             gen_loss = (gen_loss1 + gen_loss2) / 2
 
             # 4. 相似度损失计算（与训练一致）
