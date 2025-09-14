@@ -300,11 +300,11 @@ def main():
         # train_total, train_gen, train_sim = train_one_epoch(epoch)
         train_total, train_gen, train_sim = 0, 0, 0
 
-        # 2. 验证一个epoch
-        val_total, val_gen, val_sim = validate_one_epoch(epoch)
-
-        # 3. 学习率调度（每个epoch后更新）
+        # 2. 学习率调度（每个epoch后更新）
         sch.step()
+
+        # 3. 验证一个epoch
+        val_total, val_gen, val_sim = validate_one_epoch(epoch)
 
         # 4. 计算epoch耗时
         epoch_time = time.time() - epoch_start_time
@@ -320,7 +320,7 @@ def main():
         if val_total < best_val_loss:
             best_val_loss = val_total  # 更新最佳损失
             # 构建模型保存路径
-            best_model_path = os.path.join(config["save_path"], config["best_model_name"])
+            best_model_path = os.path.join(config["save_path"], "best_model")
             # 保存模型权重与训练状态（便于后续加载继续训练）
             torch.save({
                 "epoch": epoch + 1,  # 当前epoch（已完成）
@@ -343,7 +343,7 @@ def main():
     print("\n" + "="*50)
     print("训练完成！")
     print(f"最佳验证总损失：{best_val_loss:.4f}")
-    print(f"最佳模型路径：{os.path.join(config['save_path'], config['best_model_name'])}")
+    print(f"最佳模型路径：{os.path.join(config['save_path'], 'best_model')}")
     print("="*50)
 
 
