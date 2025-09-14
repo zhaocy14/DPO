@@ -249,11 +249,10 @@ class SimilarityModelImage(nn.Module):
         self.embed_dim = embed_dim
         self.num_frames = num_frames
         self.positional_encoding = PositionalEncoding(self.embed_dim*2, max_len=num_frames)
-        self.encoder = TransformerEncoderModel(embed_dim*2, nhead, num_layers)
 
         # Transformer编码器层
         self.transformer_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
+            d_model=self.embed_dim*2,
             nhead=nhead,
             batch_first=True
         )
