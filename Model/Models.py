@@ -68,7 +68,7 @@ class ImageEmbedding(nn.Module):
                 out = self.cnn_layers[2 * i](out)
                 if self.residual_layers[i] is not None:
                     residual = self.residual_layers[i](residual)
-                out += residual
+                out = out + residual
                 out = self.cnn_layers[2 * i + 1](out)
             out = out.view(batch_size * seq_length * num_cameras, -1)
             embedded = self.fc(out)
