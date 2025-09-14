@@ -4,11 +4,9 @@ father_path = os.path.abspath(os.path.dirname(pwd) + os.path.sep + "..")
 sys.path.append(father_path)
 import time
 import torch
-import torch.nn as nn
+import numpy as np
 import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
-from torch.nn import NLLLoss
-from torch.utils.data import DataLoader, Dataset, ConcatDataset
+from torch.utils.data import DataLoader
 from DataModule.DataModule import CombinedDataset
 from Model.Models import ImageEmbedding, MotorEmbedding, EncoderOnlyCandidateGenerator, SimilarityModelImage, SimilarityModelDriver
 from tqdm import tqdm
@@ -23,7 +21,7 @@ print(f"使用设备: {device}")
 config = {
     # training parameters
     "batch_size": 4,
-    "epochs": 10,
+    "epochs": 1,
     "lr": 1e-5,
     # "weight_decay": 1e-5,
     "sampling_workers": 15,
@@ -44,8 +42,8 @@ config = {
 
     # data/model storage paths
     "data_root_dirs": '/data/cyzhao/collector_cydpo',  # 根据实际情况修改
-    "save_path": "./saved_models"
-
+    "save_path": "./saved_models",
+    "loss_data_path": "./loss_records"  # 仅保存loss数据的目录
 }
 
 os.makedirs(config["save_path"], exist_ok=True)
@@ -291,7 +289,18 @@ def main():
     print("="*50)
     print("开始训练（含验证集评估）")
     print(f"总epoch数：{config['epochs']} | 批量大小：{config['batch_size']} | 设备：{device}")
+    print(f"总Epoch数：{config['epochs']} | loss数据保存目录：{config['loss_data_path']}")
     print("="*50)
+
+    # 用list记录loss（核心修改）
+    loss_records = {
+        "train_total": [],
+        "train_gen": [],
+        "train_sim": [],
+        "val_total": [],
+        "val_gen": [],
+        "val_sim": []
+    }
 
     for epoch in range(config["epochs"]):
         epoch_start_time = time.time()
@@ -308,6 +317,14 @@ def main():
 
         # 4. 计算epoch耗时
         epoch_time = time.time() - epoch_start_time
+
+        # 记录loss
+        loss_records["train_total"].append(train_total)
+        loss_records["train_gen"].append(train_gen)
+        loss_records["train_sim"].append(train_sim)
+        loss_records["val_total"].append(val_total)
+        loss_records["val_gen"].append(val_gen)
+        loss_records["val_sim"].append(val_sim)
 
         # 5. 打印epoch统计信息
         print("\n" + "="*30)
@@ -338,6 +355,9 @@ def main():
             }, best_model_path)
 
             print(f"✅ 保存最佳模型（验证总损失：{best_val_loss:.4f}）至：{best_model_path}")
+
+    loss_save_path = os.path.join(config["loss_data_path"], "loss_records.npy")
+    np.save(loss_save_path, loss_records)
 
     # 训练结束后打印总结
     print("\n" + "="*50)
