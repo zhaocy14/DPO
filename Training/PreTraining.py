@@ -23,7 +23,7 @@ print(f"使用设备: {device}")
 config = {
     # training parameters
     "batch_size": 8,
-    "epochs": 10,
+    "epochs": 5,
     "lr": 1e-4,
     # "weight_decay": 1e-5,
     "sampling_workers": 10,
