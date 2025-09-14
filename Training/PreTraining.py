@@ -297,7 +297,8 @@ def main():
         epoch_start_time = time.time()
 
         # 1. 训练一个epoch
-        train_total, train_gen, train_sim = train_one_epoch(epoch)
+        # train_total, train_gen, train_sim = train_one_epoch(epoch)
+        train_total, train_gen, train_sim = 0, 0, 0
 
         # 2. 验证一个epoch
         val_total, val_gen, val_sim = validate_one_epoch(epoch)
