@@ -244,11 +244,12 @@ class SimilarityModelImage(nn.Module):
     使用Transformer encoder + 全连接层
     """
 
-    def __init__(self, embed_dim=32, num_frames=30, num_layers=3, nhead=4, similarity_dim=128):
+    def __init__(self, embed_dim=128, num_frames=30, num_layers=3, nhead=4, similarity_dim=128):
         super(SimilarityModelImage, self).__init__()
         self.embed_dim = embed_dim
         self.num_frames = num_frames
         self.positional_encoding = PositionalEncoding(self.embed_dim*2, max_len=num_frames)
+        self.encoder = TransformerEncoderModel(embed_dim*2, nhead, num_layers)
 
         # Transformer编码器层
         self.transformer_layer = nn.TransformerEncoderLayer(
