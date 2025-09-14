@@ -182,14 +182,9 @@ def train_one_epoch(epoch):
         # 3. 相似度学习任务
         # 未来图像嵌入
         future_images_emb = image_embed(future_images)  # (batch, predict_len, 2*embed_dim)
-        print(future_images_emb.shape)
-        future_imgs1_emb = future_images_emb[ :, :, 0, :]  # (batch, predict_len, embed_dim)
-        future_imgs2_emb = future_images_emb[ :, :, 1, :]  # (batch, predict_len, embed_dim)
-        # future_img1_emb = image_embed(future_imgs1.to(device))  # (batch, predict_len, embed_dim)
-        # future_img2_emb = image_embed(future_imgs2.to(device))  # (batch, predict_len, embed_dim)
 
         # 对未来图像序列和当前动作进行投射
-        img_proj = img_sim_model(future_imgs1_emb, future_imgs2_emb)  # (batch, similarity_dim)
+        img_proj = img_sim_model(future_images_emb)  # (batch, similarity_dim)
 
         # 对当前动作的最后一帧进行投射
         last_motor_embedded = motor_embedded[:, -1, :]  # (batch, embed_dim)
