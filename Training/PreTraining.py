@@ -144,9 +144,18 @@ def train_one_epoch(epoch):
     total_sim_loss = 0.0
     total_loss = 0.0
 
-    pbar = tqdm(train_loader, desc=f"训练 Epoch {epoch + 1}/{config['epochs']}")
+    max_train_batches = 50  # 只训练前50个batch（按需调整）
+    batch_count = 0  # 计数当前epoch已训练的batch数
 
-    for batch in pbar:
+    pbar = tqdm(enumerate(train_loader), desc=f"训练 Epoch {epoch + 1}/{config['epochs']}",
+                total=min(max_train_batches, len(train_loader)))  # 进度条只显示到max_train_batches
+
+
+    for batch_idx, batch in pbar:
+        if batch_count >= max_train_batches:
+            print(f"\n已训练{max_train_batches}个batch，提前终止当前epoch")
+            break
+        batch_count += 1  # 计数+1
         # 解包数据并移动到设备
         imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
         # 调整图像数据形状 (batch, seq, 3, H, W) -> (batch, seq, num_cameras, 3, H, W)
