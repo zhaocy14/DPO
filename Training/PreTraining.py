@@ -26,7 +26,7 @@ config = {
     "epochs": 100,
     "lr": 1e-4,
     # "weight_decay": 1e-5,
-    "sampling_workers": 30,
+    "sampling_workers": 15,
 
     # generator model parameters
     "embed_dim_gen": 128,
@@ -166,7 +166,7 @@ def train_one_epoch(epoch):
 
         # 2. 动作生成任务 - 使用NLL损失
         # 为了简化，我们只预测下一帧动作
-        next_driver = future_driver[:, 0, :]  # (batch, motor_dim)
+        next_driver = future_driver[:, 0, :].to(device)  # (batch, motor_dim)
 
         # 获取生成器输出的均值和方差
         outputs = candidate_generator(image_embedded, motor_embedded, num_candidates=1, temperature=1.0)
