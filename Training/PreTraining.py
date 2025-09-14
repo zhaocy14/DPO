@@ -36,8 +36,8 @@ config = {
     "gen_seq_len": 30,  # 观测长度
 
 
-    "sim_seq_len": 30,  # 预测长度
-    "embed_dim_sim": 32,
+    "sim_seq_len": 15,  # 预测长度
+    "embed_dim_sim": 128,
     "num_layers_sim": 3,
     "nhead_sim": 4,
     "similarity_dim": 32,
