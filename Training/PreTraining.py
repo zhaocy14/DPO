@@ -144,6 +144,7 @@ def train_one_epoch(epoch):
 
         # 调整图像数据形状 (batch, seq, 3, H, W) -> (batch, seq, num_cameras, 3, H, W)
         images = torch.stack([imgs1, imgs2], dim=2).to(device)  # (batch, seq, 2, 3, H, W)
+        print(images.shape)
         future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(device)
 
         driver = driver.to(device)  # (batch, frame_len, motor_dim)
