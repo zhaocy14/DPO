@@ -183,9 +183,9 @@ def train_one_epoch(epoch):
         # 3. 相似度学习任务
         # 未来图像嵌入
         future_images_emb = image_embed(future_images)  # (batch, predict_len, 2*embed_dim)
+        print(future_images_emb.shape)
         future_imgs1_emb = future_images_emb[ :, :, 0, :]  # (batch, predict_len, embed_dim)
         future_imgs2_emb = future_images_emb[ :, :, 1, :]  # (batch, predict_len, embed_dim)
-        print(future_imgs1_emb.shape, future_imgs2_emb.shape)
         # future_img1_emb = image_embed(future_imgs1.to(device))  # (batch, predict_len, embed_dim)
         # future_img2_emb = image_embed(future_imgs2.to(device))  # (batch, predict_len, embed_dim)
 
