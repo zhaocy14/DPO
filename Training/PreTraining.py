@@ -214,9 +214,9 @@ def train_one_epoch(epoch):
         })
 
     # 计算平均损失
-    avg_gen_loss = total_gen_loss / len(walker_dataloader)
-    avg_sim_loss = total_sim_loss / len(walker_dataloader)
-    avg_total_loss = total_loss / len(walker_dataloader)
+    avg_gen_loss = total_gen_loss / len(train_dataset)
+    avg_sim_loss = total_sim_loss / len(train_dataset)
+    avg_total_loss = total_loss / len(train_dataset)
 
     return avg_total_loss, avg_gen_loss, avg_sim_loss
 
