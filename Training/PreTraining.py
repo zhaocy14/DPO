@@ -165,6 +165,7 @@ def train_one_epoch(epoch):
         future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(device)
 
         driver = driver.to(device)  # (batch, frame_len, motor_dim)
+        driver = driver*0
 
         # 清零梯度
         optimizer.zero_grad()
