@@ -149,6 +149,7 @@ class TransformerEncoderModel(nn.Module):
 
         return layer_outputs  # 返回所有层的输出列表，最后一个元素是最终输出
 
+
 class EncoderOnlyCandidateGenerator(nn.Module):
     def __init__(self, embed_dim, nhead, num_layers, motor_dim=2, max_seq_length=100):
         super().__init__()
@@ -156,19 +157,23 @@ class EncoderOnlyCandidateGenerator(nn.Module):
         self.positional_encoding = PositionalEncoding(self.d_model, max_seq_length)
         self.encoder = TransformerEncoderModel(embed_dim, nhead, num_layers)
 
-        # 输出层：预测1帧动作的分布参数（以连续动作为例，预测均值和标准差）
-        self.fc_mean = nn.Linear(self.d_model, motor_dim)  # 动作均值
-        self.fc_logvar = nn.Linear(self.d_model, motor_dim)  # 动作对数方差（便于计算标准差）
-        # （如果是离散动作，可用nn.Linear(self.d_model, num_classes) + softmax）
+        # 输出层：为两种数据分别预测分布参数
+        # 第一组数据的分布参数
+        self.fc_mean1 = nn.Linear(self.d_model, motor_dim)  # 第一组均值
+        self.fc_logvar1 = nn.Linear(self.d_model, motor_dim)  # 第一组对数方差
+
+        # 第二组数据的分布参数
+        self.fc_mean2 = nn.Linear(self.d_model, motor_dim)  # 第二组均值
+        self.fc_logvar2 = nn.Linear(self.d_model, motor_dim)  # 第二组对数方差
 
     def forward(self, image_embedded, motor_embedded, num_candidates=5, temperature=0.5):
         """
-        生成多个1帧动作候选
+        生成多个1帧动作候选，返回两组数据及其分布参数
         :param image_embedded: 图像嵌入 (batch, seq, 2*embed_dim)
         :param motor_embedded: 历史电机嵌入 (batch, seq, embed_dim)
         :param num_candidates: 候选数量
         :param temperature: 温度参数（控制采样随机性，>0，越小越集中）
-        :return: 候选动作列表 (num_candidates, batch, 1, motor_dim)
+        :return: 两组候选动作列表及对应的均值和标准差
         """
         # 1. 融合输入特征
         combined = torch.cat([motor_embedded, image_embedded], dim=-1)  # (batch, seq, 3*embed_dim)
@@ -179,22 +184,43 @@ class EncoderOnlyCandidateGenerator(nn.Module):
         encoder_out = encoder_out[-1]
         global_feat = encoder_out.mean(dim=1)  # 取序列均值作为全局特征 (batch, 3*embed_dim)
 
-        # 3. 预测动作的分布参数（均值+标准差）
-        mean = self.fc_mean(global_feat)  # (batch, motor_dim)
-        logvar = self.fc_logvar(global_feat)  # (batch, motor_dim)
-        # 限制logvar范围，避免标准差过大/过小
-        logvar = torch.clamp(logvar, min=-5, max=5)
-        std = torch.exp(0.5 * logvar) * temperature  # 温度调整标准差（温度越高，随机性越强）
+        # 3. 预测第一组数据的分布参数（均值+标准差）
+        mean1 = self.fc_mean1(global_feat)  # (batch, motor_dim)
+        logvar1 = self.fc_logvar1(global_feat)  # (batch, motor_dim)
+        logvar1 = torch.clamp(logvar1, min=-5, max=5)
+        std1 = torch.exp(0.5 * logvar1) * temperature  # 温度调整标准差
 
-        # 4. 从高斯分布中多次采样，生成候选
-        candidates = []
+        # 预测第二组数据的分布参数（均值+标准差）
+        mean2 = self.fc_mean2(global_feat)  # (batch, motor_dim)
+        logvar2 = self.fc_logvar2(global_feat)  # (batch, motor_dim)
+        logvar2 = torch.clamp(logvar2, min=-5, max=5)
+        std2 = torch.exp(0.5 * logvar2) * temperature  # 温度调整标准差
+
+        # 4. 从高斯分布中多次采样，生成候选，并使用tanh限制在[-1, 1]
+        candidates1 = []
+        candidates2 = []
         for _ in range(num_candidates):
-            # 采样：mean + std * 随机噪声
-            eps = torch.randn_like(mean)  # 标准正态分布噪声
-            sample = mean + std * eps  # (batch, motor_dim)
-            candidates.append(sample.unsqueeze(1))  # 增加时间维度 (batch, 1, motor_dim)
+            # 第一组采样
+            eps1 = torch.randn_like(mean1)  # 标准正态分布噪声
+            sample1 = mean1 + std1 * eps1  # (batch, motor_dim)
+            sample1 = torch.tanh(sample1)  # 将输出限制在[-1, 1]之间
+            candidates1.append(sample1.unsqueeze(1))  # 增加时间维度 (batch, 1, motor_dim)
 
-        return candidates  # 列表长度为num_candidates
+            # 第二组采样
+            eps2 = torch.randn_like(mean2)  # 标准正态分布噪声
+            sample2 = mean2 + std2 * eps2  # (batch, motor_dim)
+            sample2 = torch.tanh(sample2)  # 将输出限制在[-1, 1]之间
+            candidates2.append(sample2.unsqueeze(1))  # 增加时间维度 (batch, 1, motor_dim)
+
+        # 返回两组候选以及它们的均值和标准差
+        return {
+            'candidates1': candidates1,
+            'mean1': mean1,
+            'std1': std1,
+            'candidates2': candidates2,
+            'mean2': mean2,
+            'std2': std2
+        }
 
 # 新增：计算模型大小的函数
 def calculate_model_size(model):
@@ -281,11 +307,11 @@ class SimilarityModelDriver(nn.Module):
 
 # 示例使用
 if __name__ == "__main__":
-    embed_dim = 64
-    nhead = 4
-    num_layers = 30
+    embed_dim = 128
+    nhead = 8
+    num_layers = 16
     motor_dim = 2
-    max_seq_length = 30
+    seq_length = 30
 
     # 初始化模型
     image_embed = ImageEmbedding(embed_dim, num_layers=3, is_resnet=False)
@@ -295,20 +321,20 @@ if __name__ == "__main__":
         nhead=nhead,
         num_layers=num_layers,
         motor_dim=motor_dim,
-        max_seq_length=max_seq_length
+        max_seq_length=seq_length
     )
 
     # 构造输入
-    batch_size = 2
-    images = torch.randn(batch_size, max_seq_length, 2, 3, 256, 256)  # (batch, seq, 2相机, 3, H, W)
-    motor_data = torch.randn(batch_size, max_seq_length, motor_dim)  # (batch, seq, motor_dim)
+    batch_size = 1
+    images = torch.randn(batch_size, seq_length, 2, 3, 256, 256)  # (batch, seq, 2相机, 3, H, W)
+    motor_data = torch.randn(batch_size, seq_length, motor_dim)  # (batch, seq, motor_dim)
 
     # 生成候选动作
     image_embedded = image_embed(images)  # (batch, seq, 2*embed_dim)
     motor_embedded = motor_embed(motor_data)  # (batch, seq, embed_dim)
     for i in range(10):
         time_start = time.time()
-        candidates = generator(
+        outputs = generator(
             image_embedded=image_embedded,
             motor_embedded=motor_embedded,
             num_candidates=5,  # 生成5个候选
@@ -316,8 +342,8 @@ if __name__ == "__main__":
         )
         print(f"生成时间: {time.time() - time_start:.4f} 秒")
     # 输出结果形状
-    print(f"生成候选数量：{len(candidates)}")
-    print(f"单个候选形状：{candidates[0].shape}")  # (batch=2, 1, motor_dim=12)
+    print(f"生成候选数量：{len(outputs['candidates1'])}")
+    print(f"单个候选形状：{outputs['candidates1'][0].shape}")  # (batch=2, 1, motor_dim=12)
 
     # 新增：打印模型大小
     image_size = calculate_model_size(image_embed)
