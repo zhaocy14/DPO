@@ -150,7 +150,6 @@ def train_one_epoch(epoch):
     for batch in pbar:
         # 解包数据并移动到设备
         imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
-        print(imgs1.shape, imgs2.shape, driver.shape, future_imgs1.shape, future_imgs2.shape, future_driver.shape)
         # 调整图像数据形状 (batch, seq, 3, H, W) -> (batch, seq, num_cameras, 3, H, W)
         images = torch.stack([imgs1, imgs2], dim=2).to(device)  # (batch, seq, 2, 3, H, W)
 

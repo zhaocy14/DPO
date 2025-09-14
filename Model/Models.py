@@ -248,6 +248,7 @@ class SimilarityModelImage(nn.Module):
         super(SimilarityModelImage, self).__init__()
         self.embed_dim = embed_dim
         self.num_frames = num_frames
+        self.positional_encoding = PositionalEncoding(self.embed_dim, max_len=num_frames)
 
         # Transformer编码器层
         self.transformer_layer = nn.TransformerEncoderLayer(
@@ -267,18 +268,16 @@ class SimilarityModelImage(nn.Module):
             nn.Linear(embed_dim // 2, similarity_dim)
         )
 
-    def forward(self, img_embedding1, img_embedding2):
+    def forward(self, imgs_embedding):
         """
-        输入: 两个连续帧序列的图像嵌入
+        已经打包的两张图像嵌入序列
         img_embedding1: (batch_size, num_frames, embed_dim)
-        img_embedding2: (batch_size, num_frames, embed_dim)
         输出: 投射后的特征向量 (batch_size, similarity_dim)
         """
         # 将两个图像嵌入序列拼接
-        combined = torch.cat([img_embedding1, img_embedding2], dim=1)  # (batch, 2*num_frames, embed_dim)
-
+        imgs_embedding = self.positional_encoding(imgs_embedding)  # 加位置编码
         # 通过Transformer编码器
-        transformer_out = self.transformer_encoder(combined)  # (batch, 2*num_frames, embed_dim)
+        transformer_out = self.transformer_encoder(imgs_embedding)  # (batch, 2*num_frames, embed_dim)
 
         # 取最后一个时间步的输出作为特征
         feature = transformer_out[:, -1, :]  # (batch, embed_dim)
