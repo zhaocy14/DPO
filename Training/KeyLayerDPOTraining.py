@@ -46,7 +46,7 @@ CONFIG = {
     "sampling_workers": 2,
     "max_train_samples_per_epoch": 100,
     "dpo_beta": 0.1,
-    "repeat_threshold": 0.9,
+    "repeat_threshold": 0.95,
     "history_cache_size": 10,
     "use_candidates": "candidates1",
     "embed_dim_gen": 128,
