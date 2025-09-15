@@ -1,4 +1,4 @@
-import os,sys
+import os, sys
 pwd = os.path.abspath(os.path.abspath(__file__))
 father_path = os.path.abspath(os.path.dirname(pwd) + os.path.sep + "..")
 sys.path.append(father_path)
@@ -8,10 +8,10 @@ import numpy as np
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from DataModule.DataModule import CombinedDataset
-from Model.Models import ImageEmbedding, MotorEmbedding, EncoderOnlyCandidateGenerator, SimilarityModelImage, SimilarityModelDriver
+from Model.Models import ImageEmbedding, MotorEmbedding, EncoderOnlyCandidateGenerator, SimilarityModelImage, \
+    SimilarityModelDriver
 from tqdm import tqdm
 from Model.Models import calculate_model_size
-# from Training.DPOTraining import optimizer
 
 # 设置设备为第三张显卡 (cuda:2)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -23,16 +23,14 @@ config = {
     "batch_size": 4,
     "epochs": 100,
     "lr": 1e-5,
-    # "weight_decay": 1e-5,
     "sampling_workers": 15,
 
     # generator model parameters
     "embed_dim_gen": 128,
     "nhead_gen": 8,
     "num_layers_gen": 16,
-    "motor_dim": 2,
+    "motor_dim": 2,  # 每个动作包含2个电机信号
     "gen_seq_len": 30,  # 观测长度
-
 
     "sim_seq_len": 30,  # 预测长度
     "embed_dim_sim": 128,
@@ -99,11 +97,11 @@ val_loader = DataLoader(dataset=val_dataset,
                         num_workers=config['sampling_workers'])
 
 optimizer = torch.optim.Adam(params=[{'params': image_embed.parameters()},
-                                      {'params': motor_embed.parameters()},
-                                      {'params': candidate_generator.parameters()},
-                                      {'params': img_sim_model.parameters()},
-                                      {'params': driver_sim_model.parameters()}],
-                               lr=config['lr'])
+                                     {'params': motor_embed.parameters()},
+                                     {'params': candidate_generator.parameters()},
+                                     {'params': img_sim_model.parameters()},
+                                     {'params': driver_sim_model.parameters()}],
+                             lr=config['lr'])
 sch = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
 
@@ -115,20 +113,45 @@ def nll_loss(mean, std, target):
     :param target: 真实动作标签 (batch, motor_dim)
     :return: 每个样本的NLL损失 (batch, motor_dim)
     """
-    # 避免标准差为0导致log(0)（虽然模型中已限制logvar范围，但加小epsilon更安全）
+    # 避免标准差为0导致log(0)
     eps = 1e-6
     std = std + eps
     # 计算NLL损失（简化版，忽略常数项）
     nll = torch.log(std) + (target - mean) ** 2 / (2 * std ** 2)
-    return nll
+    return nll.mean()  # 对两个电机信号的损失取平均
 
-def cos_loss(img_proj, driver_proj):
-    # 计算余弦相似度
-    cos_sim = F.cosine_similarity(img_proj, driver_proj, dim=1)  # 形状: (batch_size,)
 
-    # 损失 = 1 - 余弦相似度（均值），目标是让损失接近0
-    sim_loss = (1 - cos_sim).mean()
-    return sim_loss
+def info_ce_loss(img_proj, candidate_projections, temperature=0.1):
+    """
+    计算Noise Contrastive Estimation Loss (InfoCE Loss)
+    :param img_proj: 未来图像序列的投影 (batch, similarity_dim)
+    :param candidate_projections: 候选动作的投影列表，第一个元素是正样本
+    :param temperature: 温度参数，控制分布的陡峭程度
+    :return: InfoCE损失值
+    """
+    batch_size = img_proj.shape[0]
+
+    # 将所有候选投影拼接成 (batch, num_candidates, similarity_dim)
+    candidates = torch.stack(candidate_projections, dim=1)
+
+    # 计算图像投影与每个候选动作投影的相似度 (batch, num_candidates)
+    similarities = F.cosine_similarity(
+        img_proj.unsqueeze(1),  # (batch, 1, similarity_dim)
+        candidates,  # (batch, num_candidates, similarity_dim)
+        dim=2
+    )
+
+    # 应用温度缩放
+    similarities = similarities / temperature
+
+    # InfoCE Loss：第一个候选是正样本，其余是负样本
+    loss = F.cross_entropy(
+        similarities,
+        torch.zeros(batch_size, dtype=torch.long, device=img_proj.device)
+    )
+
+    return loss
+
 
 start_time = time.time()
 
@@ -145,27 +168,24 @@ def train_one_epoch(epoch):
     total_sim_loss = 0.0
     total_loss = 0.0
 
-    max_train_batches = 10  # 只训练前50个batch（按需调整）
+    max_train_batches = 10  # 只训练前10个batch
     batch_count = 0  # 计数当前epoch已训练的batch数
 
     pbar = tqdm(enumerate(train_loader), desc=f"训练 Epoch {epoch + 1}/{config['epochs']}",
-                total=min(max_train_batches, len(train_loader)))  # 进度条只显示到max_train_batches
-
+                total=min(max_train_batches, len(train_loader)))
 
     for batch_idx, batch in pbar:
         if batch_count >= max_train_batches:
             print(f"\n已训练{max_train_batches}个batch，提前终止当前epoch")
             break
-        batch_count += 1  # 计数+1
+        batch_count += 1
+
         # 解包数据并移动到设备
         imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
-        # 调整图像数据形状 (batch, seq, 3, H, W) -> (batch, seq, num_cameras, 3, H, W)
         images = torch.stack([imgs1, imgs2], dim=2).to(device)  # (batch, seq, 2, 3, H, W)
-
         future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(device)
-
         driver = driver.to(device)  # (batch, frame_len, motor_dim)
-        # driver = driver*0
+        next_driver = future_driver[:, 0, :].to(device)  # (batch, motor_dim)，下一帧完整动作
 
         # 清零梯度
         optimizer.zero_grad()
@@ -175,33 +195,46 @@ def train_one_epoch(epoch):
         motor_embedded = motor_embed(driver)  # (batch, seq, embed_dim)
 
         # 2. 动作生成任务 - 使用NLL损失
-        # 为了简化，我们只预测下一帧动作
-        next_driver = future_driver[:, 0, :].to(device)  # (batch, motor_dim)
+        # 获取生成器输出的均值、方差以及候选动作
+        num_candidates = 5  # 生成5个候选动作
+        outputs = candidate_generator(image_embedded, motor_embedded, num_candidates=num_candidates, temperature=1.0)
 
-        # 获取生成器输出的均值和方差
-        outputs = candidate_generator(image_embedded, motor_embedded, num_candidates=1, temperature=1.0)
-        mean1 = outputs['mean1']
-        std1 = outputs['std1']
-        mean2 = outputs['mean2']
-        std2 = outputs['std2']
+        # 构建完整动作的均值和标准差 (batch, motor_dim)
+        mean = torch.stack([outputs['mean1'], outputs['mean2']], dim=1)  # 合并两个电机的均值
+        std = torch.stack([outputs['std1'], outputs['std2']], dim=1)  # 合并两个电机的标准差
 
-        gen_loss1 = nll_loss(mean1, std1, next_driver[0]).mean()
-        gen_loss2 = nll_loss(mean2, std2, next_driver[1]).mean()
-        gen_loss = (gen_loss1 + gen_loss2) / 2
+        # 计算生成损失（同时考虑两个电机）
+        gen_loss = nll_loss(mean, std, next_driver)
 
-        # 3. 相似度学习任务
+        # 3. 相似度学习任务 - 使用InfoCE Loss
         # 未来图像嵌入
         future_images_emb = image_embed(future_images)  # (batch, predict_len, 2*embed_dim)
-
-        # 对未来图像序列和当前动作进行投射
         img_proj = img_sim_model(future_images_emb)  # (batch, similarity_dim)
 
-        # 对当前动作的最后一帧进行投射
-        last_motor_embedded = motor_embedded[:, -1, :]  # (batch, embed_dim)
-        driver_proj = driver_sim_model(last_motor_embedded) # (batch, similarity_dim)
+        # 准备候选动作：将均值动作作为正样本，其他候选作为负样本
+        # 构建完整的均值动作 (batch, 1, motor_dim)
+        mean_action = mean.unsqueeze(1)  # 增加时间维度
+        mean_embedded = motor_embed(mean_action)  # 嵌入均值动作
+        mean_proj = driver_sim_model(mean_embedded[:, -1, :])  # 投影到相似度空间
 
-        # 相似度损失：希望余弦相似度接近1
-        sim_loss = cos_loss(img_proj=img_proj, driver_proj=driver_proj)
+        # 构建候选动作投影列表
+        candidate_projections = [mean_proj]  # 第一个是正样本（均值动作）
+
+        # 处理所有候选动作（每个候选包含两个电机的值）
+        for i in range(num_candidates):
+            # 合并两个电机的候选值，构建完整动作 (batch, 1, motor_dim)
+            candidate_action = torch.stack([
+                outputs['candidates1'][i].squeeze(1),  # 第一个电机的候选值
+                outputs['candidates2'][i].squeeze(1)  # 第二个电机的候选值
+            ], dim=1).unsqueeze(1)
+
+            # 嵌入并投影候选动作
+            candidate_embedded = motor_embed(candidate_action)
+            candidate_proj = driver_sim_model(candidate_embedded[:, -1, :])
+            candidate_projections.append(candidate_proj)
+
+        # 计算InfoCE损失
+        sim_loss = info_ce_loss(img_proj, candidate_projections)
 
         # 总损失：加权求和两个任务的损失
         loss = gen_loss + sim_loss
@@ -229,8 +262,9 @@ def train_one_epoch(epoch):
 
     return avg_total_loss, avg_gen_loss, avg_sim_loss
 
+
 def validate_one_epoch(epoch):
-    # 设为评估模式（关闭dropout，冻结batchnorm统计）
+    # 设为评估模式
     image_embed.eval()
     motor_embed.eval()
     candidate_generator.eval()
@@ -241,50 +275,69 @@ def validate_one_epoch(epoch):
     total_sim_loss = 0.0
     total_loss = 0.0
 
-    max_val_batches = 10  # 只训练前50个batch（按需调整）
-    batch_count = 0  # 计数当前epoch已训练的batch数
+    max_val_batches = 10  # 只验证前10个batch
+    batch_count = 0  # 计数当前epoch已验证的batch数
 
     pbar = tqdm(enumerate(val_loader), desc=f"验证 Epoch {epoch + 1}/{config['epochs']}",
-                total=min(max_val_batches, len(val_loader)))  # 进度条只显示到max_train_batches
-    # 关闭梯度计算（加速验证，避免内存占用）
+                total=min(max_val_batches, len(val_loader)))
+
     with torch.no_grad():
         for batch_idx, batch in pbar:
             if batch_count >= max_val_batches:
                 print(f"\n已验证{max_val_batches}个batch，提前终止当前epoch")
                 break
-            batch_count += 1  # 计数+1
+            batch_count += 1
 
-            # 1. 解包数据（与训练逻辑完全一致）
+            # 解包数据
             imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
             images = torch.stack([imgs1, imgs2], dim=2).to(device)
             future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(device)
             driver = driver.to(device)
-            future_driver = future_driver.to(device)
+            next_driver = future_driver[:, 0, :].to(device)  # 下一帧完整动作
 
-            # 2. 特征嵌入（无梯度计算）
+            # 特征嵌入
             image_embedded = image_embed(images)
             motor_embedded = motor_embed(driver)
 
-            # 3. 动作生成损失计算（与训练一致）
-            next_driver = future_driver[:, 0, :]
+            # 动作生成损失计算
+            num_candidates = 5
             outputs = candidate_generator(
                 image_embedded=image_embedded,
                 motor_embedded=motor_embedded,
-                num_candidates=1,
+                num_candidates=num_candidates,
                 temperature=1.0
             )
-            gen_loss1 = nll_loss(outputs['mean1'], outputs['std1'], next_driver[0]).mean()
-            gen_loss2 = nll_loss(outputs['mean2'], outputs['std2'], next_driver[1]).mean()
-            gen_loss = (gen_loss1 + gen_loss2) / 2
 
-            # 4. 相似度损失计算（与训练一致）
+            # 构建完整动作的均值和标准差
+            mean = torch.stack([outputs['mean1'], outputs['mean2']], dim=1)
+            std = torch.stack([outputs['std1'], outputs['std2']], dim=1)
+            gen_loss = nll_loss(mean, std, next_driver)
+
+            # 相似度损失计算（使用InfoCE Loss）
             future_image_embedded = image_embed(future_images)
             img_proj = img_sim_model(future_image_embedded)
-            last_motor_embedded = motor_embedded[:, -1, :]
-            driver_proj = driver_sim_model(last_motor_embedded)
-            sim_loss = cos_loss(img_proj, driver_proj)
 
-            # 5. 累计验证损失
+            # 处理均值动作作为正样本
+            mean_action = mean.unsqueeze(1)
+            mean_embedded = motor_embed(mean_action)
+            mean_proj = driver_sim_model(mean_embedded[:, -1, :])
+            candidate_projections = [mean_proj]
+
+            # 处理所有候选动作
+            for i in range(num_candidates):
+                candidate_action = torch.stack([
+                    outputs['candidates1'][i].squeeze(1),
+                    outputs['candidates2'][i].squeeze(1)
+                ], dim=1).unsqueeze(1)
+
+                candidate_embedded = motor_embed(candidate_action)
+                candidate_proj = driver_sim_model(candidate_embedded[:, -1, :])
+                candidate_projections.append(candidate_proj)
+
+            # 计算InfoCE损失
+            sim_loss = info_ce_loss(img_proj, candidate_projections)
+
+            # 累计验证损失
             total_batch_loss = gen_loss + sim_loss
             total_gen_loss += gen_loss.item()
             total_sim_loss += sim_loss.item()
@@ -305,14 +358,14 @@ def validate_one_epoch(epoch):
 
 
 def main():
-    best_val_loss = float('inf')  # 初始化最佳验证损失（无穷大）
-    print("="*50)
+    best_val_loss = float('inf')  # 初始化最佳验证损失
+    print("=" * 50)
     print("开始训练（含验证集评估）")
     print(f"总epoch数：{config['epochs']} | 批量大小：{config['batch_size']} | 设备：{device}")
     print(f"总Epoch数：{config['epochs']} | loss数据保存目录：{config['loss_data_path']}")
-    print("="*50)
+    print("=" * 50)
 
-    # 用list记录loss（核心修改）
+    # 用list记录loss
     loss_records = {
         "train_total": [],
         "train_gen": [],
@@ -327,9 +380,8 @@ def main():
 
         # 1. 训练一个epoch
         train_total, train_gen, train_sim = train_one_epoch(epoch)
-        # train_total, train_gen, train_sim = 0, 0, 0
 
-        # 2. 学习率调度（每个epoch后更新）
+        # 2. 学习率调度
         sch.step()
 
         # 3. 验证一个epoch
@@ -347,21 +399,19 @@ def main():
         loss_records["val_sim"].append(val_sim)
 
         # 5. 打印epoch统计信息
-        print("\n" + "="*30)
+        print("\n" + "=" * 30)
         print(f"Epoch {epoch + 1}/{config['epochs']} | 耗时：{epoch_time:.2f}秒")
         print(f"【训练集】总损失：{train_total:.4f} | 生成损失：{train_gen:.4f} | 相似度损失：{train_sim:.4f}")
         print(f"【验证集】总损失：{val_total:.4f} | 生成损失：{val_gen:.4f} | 相似度损失：{val_sim:.4f}")
-        print("="*30 + "\n")
+        print("=" * 30 + "\n")
 
-        # 6. 保存最佳模型（仅当当前验证损失优于历史最佳时）
+        # 6. 保存最佳模型
         if val_total < best_val_loss:
-            best_val_loss = val_total  # 更新最佳损失
-            # 构建模型保存路径
+            best_val_loss = val_total
             best_model_path = os.path.join(config["save_path"], "best_model")
-            # 保存模型权重与训练状态（便于后续加载继续训练）
             torch.save({
-                "epoch": epoch + 1,  # 当前epoch（已完成）
-                "best_val_loss": best_val_loss,  # 最佳验证损失
+                "epoch": epoch + 1,
+                "best_val_loss": best_val_loss,
                 "model_states": {
                     "image_embed": image_embed.state_dict(),
                     "motor_embed": motor_embed.state_dict(),
@@ -369,9 +419,9 @@ def main():
                     "img_sim_model": img_sim_model.state_dict(),
                     "driver_sim_model": driver_sim_model.state_dict()
                 },
-                "optimizer_state": optimizer.state_dict(),  # 优化器状态
-                "scheduler_state": sch.state_dict(),  # 学习率调度器状态
-                "config": config  # 训练配置（便于复现）
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": sch.state_dict(),
+                "config": config
             }, best_model_path)
 
             print(f"✅ 保存最佳模型（验证总损失：{best_val_loss:.4f}）至：{best_model_path}")
@@ -380,11 +430,11 @@ def main():
     np.save(loss_save_path, loss_records)
 
     # 训练结束后打印总结
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("训练完成！")
     print(f"最佳验证总损失：{best_val_loss:.4f}")
     print(f"最佳模型路径：{os.path.join(config['save_path'], 'best_model')}")
-    print("="*50)
+    print("=" * 50)
 
 
 if __name__ == "__main__":

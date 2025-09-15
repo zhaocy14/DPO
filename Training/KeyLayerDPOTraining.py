@@ -71,116 +71,116 @@ os.makedirs(os.path.dirname(CONFIG["dpo_save_path"]), exist_ok=True)
 os.makedirs(os.path.dirname(CONFIG["dpo_loss_path"]), exist_ok=True)
 
 
-# ---------------------- Transformer相关模型定义（确保与提供的代码一致） ----------------------
-class TransformerEncoderModel(nn.Module):
-    def __init__(self, embed_dim=64, nhead=8, num_layers=16):
-        super(TransformerEncoderModel, self).__init__()
-        # 存储每一层的编码器
-        self.layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(d_model=embed_dim * 3, nhead=nhead, batch_first=True)
-            for _ in range(num_layers)
-        ])
-        # 为每一层创建训练控制开关，默认都参与训练
-        self.layer_trainable = nn.Parameter(torch.ones(num_layers, dtype=torch.bool), requires_grad=False)
-
-    def set_layer_trainable(self, layer_idx, trainable):
-        """设置指定层是否参与训练"""
-        if 0 <= layer_idx < len(self.layers):
-            self.layer_trainable[layer_idx] = trainable
-
-    def forward(self, src):
-        """返回每一层的输出结果列表"""
-        layer_outputs = []
-        current = src
-
-        for i, layer in enumerate(self.layers):
-            # 根据开关决定是否让该层参与训练
-            if self.layer_trainable[i]:
-                # 该层参与训练，正常计算
-                current = layer(current)
-            else:
-                # 该层不参与训练，关闭梯度计算
-                with torch.no_grad():
-                    current = layer(current)
-
-            # 保存当前层的输出
-            layer_outputs.append(current)
-
-        return layer_outputs  # 返回所有层的输出列表，最后一个元素是最终输出
-
-
-class EncoderOnlyCandidateGenerator(nn.Module):
-    def __init__(self, embed_dim, nhead, num_layers, motor_dim=2, max_seq_length=100):
-        super().__init__()
-        self.d_model = embed_dim * 3  # 融合后的特征维度
-        self.positional_encoding = PositionalEncoding(self.d_model, max_seq_length)
-        self.encoder = TransformerEncoderModel(embed_dim, nhead, num_layers)
-
-        # 输出层：为两种数据分别预测分布参数
-        # 第一组数据的分布参数
-        self.fc_mean1 = nn.Linear(self.d_model, motor_dim)  # 第一组均值
-        self.fc_logvar1 = nn.Linear(self.d_model, motor_dim)  # 第一组对数方差
-
-        # 第二组数据的分布参数
-        self.fc_mean2 = nn.Linear(self.d_model, motor_dim)  # 第二组均值
-        self.fc_logvar2 = nn.Linear(self.d_model, motor_dim)  # 第二组对数方差
-
-    def forward(self, image_embedded, motor_embedded, num_candidates=5, temperature=0.5):
-        """
-        生成多个1帧动作候选，返回两组数据及其分布参数
-        :param image_embedded: 图像嵌入 (batch, seq, 2*embed_dim)
-        :param motor_embedded: 历史电机嵌入 (batch, seq, embed_dim)
-        :param num_candidates: 候选数量
-        :param temperature: 温度参数（控制采样随机性，>0，越小越集中）
-        :return: 两组候选动作列表及对应的均值和标准差
-        """
-        # 1. 融合输入特征
-        combined = torch.cat([motor_embedded, image_embedded], dim=-1)  # (batch, seq, 3*embed_dim)
-        combined = self.positional_encoding(combined)  # 加位置编码
-
-        # 2. Encoder提取全局特征
-        encoder_out = self.encoder(combined)  # 得到每一层的输出列表
-        final_out = encoder_out[-1]
-        global_feat = final_out.mean(dim=1)  # 取序列均值作为全局特征 (batch, 3*embed_dim)
-
-        # 3. 预测第一组数据的分布参数（均值+标准差）
-        mean1 = self.fc_mean1(global_feat)  # (batch, motor_dim)
-        logvar1 = self.fc_logvar1(global_feat)  # (batch, motor_dim)
-        logvar1 = torch.clamp(logvar1, min=-5, max=5)
-        std1 = torch.exp(0.5 * logvar1) * temperature  # 温度调整标准差
-
-        # 预测第二组数据的分布参数（均值+标准差）
-        mean2 = self.fc_mean2(global_feat)  # (batch, motor_dim)
-        logvar2 = self.fc_logvar2(global_feat)  # (batch, motor_dim)
-        logvar2 = torch.clamp(logvar2, min=-5, max=5)
-        std2 = torch.exp(0.5 * logvar2) * temperature  # 温度调整标准差
-
-        # 4. 从高斯分布中多次采样，生成候选，并使用tanh限制在[-1, 1]
-        candidates1 = []
-        candidates2 = []
-        for _ in range(num_candidates):
-            # 第一组采样
-            eps1 = torch.randn_like(mean1)  # 标准正态分布噪声
-            sample1 = mean1 + std1 * eps1  # (batch, motor_dim)
-            sample1 = torch.tanh(sample1)  # 将输出限制在[-1, 1]之间
-            candidates1.append(sample1.unsqueeze(1))  # 增加时间维度 (batch, 1, motor_dim)
-
-            # 第二组采样
-            eps2 = torch.randn_like(mean2)  # 标准正态分布噪声
-            sample2 = mean2 + std2 * eps2  # (batch, motor_dim)
-            sample2 = torch.tanh(sample2)  # 将输出限制在[-1, 1]之间
-            candidates2.append(sample2.unsqueeze(1))  # 增加时间维度 (batch, 1, motor_dim)
-
-        # 返回两组候选以及它们的均值和标准差，同时返回所有层的输出用于关键层识别
-        return {
-            'candidates1': candidates1,
-            'mean1': mean1,
-            'std1': std1,
-            'candidates2': candidates2,
-            'mean2': mean2,
-            'std2': std2,
-            'encoder_layer_outputs': encoder_out  # 新增：返回每一层的输出
-        }
+# # ---------------------- Transformer相关模型定义（确保与提供的代码一致） ----------------------
+# class TransformerEncoderModel(nn.Module):
+#     def __init__(self, embed_dim=64, nhead=8, num_layers=16):
+#         super(TransformerEncoderModel, self).__init__()
+#         # 存储每一层的编码器
+#         self.layers = nn.ModuleList([
+#             nn.TransformerEncoderLayer(d_model=embed_dim * 3, nhead=nhead, batch_first=True)
+#             for _ in range(num_layers)
+#         ])
+#         # 为每一层创建训练控制开关，默认都参与训练
+#         self.layer_trainable = nn.Parameter(torch.ones(num_layers, dtype=torch.bool), requires_grad=False)
+#
+#     def set_layer_trainable(self, layer_idx, trainable):
+#         """设置指定层是否参与训练"""
+#         if 0 <= layer_idx < len(self.layers):
+#             self.layer_trainable[layer_idx] = trainable
+#
+#     def forward(self, src):
+#         """返回每一层的输出结果列表"""
+#         layer_outputs = []
+#         current = src
+#
+#         for i, layer in enumerate(self.layers):
+#             # 根据开关决定是否让该层参与训练
+#             if self.layer_trainable[i]:
+#                 # 该层参与训练，正常计算
+#                 current = layer(current)
+#             else:
+#                 # 该层不参与训练，关闭梯度计算
+#                 with torch.no_grad():
+#                     current = layer(current)
+#
+#             # 保存当前层的输出
+#             layer_outputs.append(current)
+#
+#         return layer_outputs  # 返回所有层的输出列表，最后一个元素是最终输出
+#
+#
+# class EncoderOnlyCandidateGenerator(nn.Module):
+#     def __init__(self, embed_dim, nhead, num_layers, motor_dim=2, max_seq_length=100):
+#         super().__init__()
+#         self.d_model = embed_dim * 3  # 融合后的特征维度
+#         self.positional_encoding = PositionalEncoding(self.d_model, max_seq_length)
+#         self.encoder = TransformerEncoderModel(embed_dim, nhead, num_layers)
+#
+#         # 输出层：为两种数据分别预测分布参数
+#         # 第一组数据的分布参数
+#         self.fc_mean1 = nn.Linear(self.d_model, motor_dim)  # 第一组均值
+#         self.fc_logvar1 = nn.Linear(self.d_model, motor_dim)  # 第一组对数方差
+#
+#         # 第二组数据的分布参数
+#         self.fc_mean2 = nn.Linear(self.d_model, motor_dim)  # 第二组均值
+#         self.fc_logvar2 = nn.Linear(self.d_model, motor_dim)  # 第二组对数方差
+#
+#     def forward(self, image_embedded, motor_embedded, num_candidates=5, temperature=0.5):
+#         """
+#         生成多个1帧动作候选，返回两组数据及其分布参数
+#         :param image_embedded: 图像嵌入 (batch, seq, 2*embed_dim)
+#         :param motor_embedded: 历史电机嵌入 (batch, seq, embed_dim)
+#         :param num_candidates: 候选数量
+#         :param temperature: 温度参数（控制采样随机性，>0，越小越集中）
+#         :return: 两组候选动作列表及对应的均值和标准差
+#         """
+#         # 1. 融合输入特征
+#         combined = torch.cat([motor_embedded, image_embedded], dim=-1)  # (batch, seq, 3*embed_dim)
+#         combined = self.positional_encoding(combined)  # 加位置编码
+#
+#         # 2. Encoder提取全局特征
+#         encoder_out = self.encoder(combined)  # 得到每一层的输出列表
+#         final_out = encoder_out[-1]
+#         global_feat = final_out.mean(dim=1)  # 取序列均值作为全局特征 (batch, 3*embed_dim)
+#
+#         # 3. 预测第一组数据的分布参数（均值+标准差）
+#         mean1 = self.fc_mean1(global_feat)  # (batch, motor_dim)
+#         logvar1 = self.fc_logvar1(global_feat)  # (batch, motor_dim)
+#         logvar1 = torch.clamp(logvar1, min=-5, max=5)
+#         std1 = torch.exp(0.5 * logvar1) * temperature  # 温度调整标准差
+#
+#         # 预测第二组数据的分布参数（均值+标准差）
+#         mean2 = self.fc_mean2(global_feat)  # (batch, motor_dim)
+#         logvar2 = self.fc_logvar2(global_feat)  # (batch, motor_dim)
+#         logvar2 = torch.clamp(logvar2, min=-5, max=5)
+#         std2 = torch.exp(0.5 * logvar2) * temperature  # 温度调整标准差
+#
+#         # 4. 从高斯分布中多次采样，生成候选，并使用tanh限制在[-1, 1]
+#         candidates1 = []
+#         candidates2 = []
+#         for _ in range(num_candidates):
+#             # 第一组采样
+#             eps1 = torch.randn_like(mean1)  # 标准正态分布噪声
+#             sample1 = mean1 + std1 * eps1  # (batch, motor_dim)
+#             sample1 = torch.tanh(sample1)  # 将输出限制在[-1, 1]之间
+#             candidates1.append(sample1.unsqueeze(1))  # 增加时间维度 (batch, 1, motor_dim)
+#
+#             # 第二组采样
+#             eps2 = torch.randn_like(mean2)  # 标准正态分布噪声
+#             sample2 = mean2 + std2 * eps2  # (batch, motor_dim)
+#             sample2 = torch.tanh(sample2)  # 将输出限制在[-1, 1]之间
+#             candidates2.append(sample2.unsqueeze(1))  # 增加时间维度 (batch, 1, motor_dim)
+#
+#         # 返回两组候选以及它们的均值和标准差，同时返回所有层的输出用于关键层识别
+#         return {
+#             'candidates1': candidates1,
+#             'mean1': mean1,
+#             'std1': std1,
+#             'candidates2': candidates2,
+#             'mean2': mean2,
+#             'std2': std2,
+#             'encoder_layer_outputs': encoder_out  # 新增：返回每一层的输出
+#         }
 
 
 # ---------------------- 1. 模型加载 ----------------------
