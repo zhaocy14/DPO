@@ -26,22 +26,23 @@ print(f"使用设备: {device}")
 # ---------------------- 1. 配置参数 ----------------------
 config = {
     # 训练参数（逐帧处理）
-    "batch_size": 1,  # 单样本逐帧输入
+    "batch_size": 1,
     "epochs": 5,
     "lr": 5e-7,
     "num_candidates": 5,
     "sampling_workers": 2,
-    "max_train_samples_per_epoch": 500,  # 训练时限制每epoch样本数（逐帧效率低）
+    "max_train_samples_per_epoch": 500,
 
     # 验证参数（全量验证）
-    "val_batch_size": 16,  # 验证仍用单样本处理（保持与训练一致的输入格式）
+    "val_batch_size": 1,
 
     # 标准DPO参数
     "dpo_beta": 0.1,
     "repeat_threshold": 0.95,
     "history_cache_size": 10,
+    "use_candidates": "candidates1",  # 选择使用哪组候选动作（candidates1或candidates2）
 
-    # 模型参数（与原训练一致）
+    # 模型参数（与提供的EncoderOnlyCandidateGenerator匹配）
     "embed_dim_gen": 128,
     "nhead_gen": 8,
     "num_layers_gen": 16,
@@ -56,17 +57,16 @@ config = {
     # 路径
     "data_root_dirs": '/data/cyzhao/collector_cydpo/dpo_data',
     "pretrained_model_path": "./saved_models/best_model",
-    "dpo_save_path": "./saved_models/dpo_full_val_best_model",
-    "dpo_loss_path": "./loss_records/dpo_full_val_loss.npy"
+    "dpo_save_path": "./saved_models/dpo_fixed_best_model",
+    "dpo_loss_path": "./loss_records/dpo_fixed_loss.npy"
 }
 
 os.makedirs(os.path.dirname(config["dpo_save_path"]), exist_ok=True)
 os.makedirs(os.path.dirname(config["dpo_loss_path"]), exist_ok=True)
 
 
-# ---------------------- 2. 模型加载（含参考模型） ----------------------
+# ---------------------- 2. 模型加载 ----------------------
 def load_models_with_reference(pretrained_path):
-    # 初始化模型
     image_embed = ImageEmbedding(embed_dim=config["embed_dim_gen"], num_layers=3, is_resnet=False).to(device)
     motor_embed = MotorEmbedding(motor_dim=config["motor_dim"], embed_dim=config["embed_dim_gen"]).to(device)
     policy_generator = EncoderOnlyCandidateGenerator(
@@ -76,7 +76,6 @@ def load_models_with_reference(pretrained_path):
         motor_dim=config["motor_dim"],
         max_seq_length=config["gen_seq_len"]
     ).to(device)
-    # 参考模型（冻结）
     ref_generator = EncoderOnlyCandidateGenerator(
         embed_dim=config["embed_dim_gen"],
         nhead=config["nhead_gen"],
@@ -113,7 +112,7 @@ def load_models_with_reference(pretrained_path):
     return image_embed, motor_embed, policy_generator, ref_generator, img_sim_model, driver_sim_model
 
 
-# ---------------------- 3. 数据加载（训练逐帧+验证全量） ----------------------
+# ---------------------- 3. 数据加载 ----------------------
 def load_data():
     data_root = config["data_root_dirs"]
     data_dir_list = [os.path.join(data_root, f) for f in os.listdir(data_root)
@@ -127,9 +126,8 @@ def load_data():
     )
     train_dataset = all_dataset.training_dataset
     val_dataset = all_dataset.val_dataset
-    print(f"训练集样本数: {len(train_dataset)} | 验证集样本数: {len(val_dataset)}（全量验证）")
+    print(f"训练集样本数: {len(train_dataset)} | 验证集样本数: {len(val_dataset)}")
 
-    # 训练集：单样本加载，限制每epoch样本数
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=config["batch_size"],
@@ -137,7 +135,6 @@ def load_data():
         num_workers=config["sampling_workers"],
         pin_memory=True
     )
-    # 验证集：单样本加载，遍历全量数据（无样本数限制）
     val_loader = DataLoader(
         dataset=val_dataset,
         batch_size=config["val_batch_size"],
@@ -157,13 +154,22 @@ def gaussian_log_prob(mean, std, action):
     return log_prob.sum(dim=-1)
 
 
-def get_generator_distribution(generator, image_embedded, motor_embedded):
+def get_generator_distribution(generator, image_embedded, motor_embedded, use_candidates):
+    """获取生成器输出的分布参数（适配模型返回的字典结构）"""
     combined = torch.cat([motor_embedded, image_embedded], dim=-1)
     combined = generator.positional_encoding(combined)
-    encoder_out = generator.encoder(combined)[-1]
+    encoder_out = generator.encoder(combined)
+    encoder_out = encoder_out[-1]
     global_feat = encoder_out.mean(dim=1)
-    mean = generator.fc_mean(global_feat)
-    logvar = generator.fc_logvar(global_feat)
+
+    # 根据配置选择对应的均值和标准差（candidates1或candidates2）
+    if use_candidates == "candidates1":
+        mean = generator.fc_mean1(global_feat)
+        logvar = generator.fc_logvar1(global_feat)
+    else:  # candidates2
+        mean = generator.fc_mean2(global_feat)
+        logvar = generator.fc_logvar2(global_feat)
+
     logvar = torch.clamp(logvar, min=-5, max=5)
     std = torch.exp(0.5 * logvar)
     return mean, std
@@ -193,15 +199,21 @@ def is_action_repeated(current_action, history_actions):
 
 
 def standard_dpo_loss(policy_gen, ref_gen, image_embedded, motor_embedded, preferred, rejected):
-    # 策略模型概率
-    policy_mean, policy_std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)
+    # 策略模型概率（使用配置指定的候选组）
+    policy_mean, policy_std = get_generator_distribution(
+        policy_gen, image_embedded, motor_embedded, config["use_candidates"]
+    )
     log_p_theta_pref = gaussian_log_prob(policy_mean, policy_std, preferred.unsqueeze(0))
     log_p_theta_rej = gaussian_log_prob(policy_mean, policy_std, rejected.unsqueeze(0))
+
     # 参考模型概率
     with torch.no_grad():
-        ref_mean, ref_std = get_generator_distribution(ref_gen, image_embedded, motor_embedded)
+        ref_mean, ref_std = get_generator_distribution(
+            ref_gen, image_embedded, motor_embedded, config["use_candidates"]
+        )
         log_p_ref_pref = gaussian_log_prob(ref_mean, ref_std, preferred.unsqueeze(0))
         log_p_ref_rej = gaussian_log_prob(ref_mean, ref_std, rejected.unsqueeze(0))
+
     # 计算损失
     advantage = (log_p_theta_pref - log_p_ref_pref) - (log_p_theta_rej - log_p_ref_rej)
     return -F.logsigmoid(config["dpo_beta"] * advantage).mean()
@@ -209,7 +221,6 @@ def standard_dpo_loss(policy_gen, ref_gen, image_embedded, motor_embedded, prefe
 
 # ---------------------- 5. 训练/验证函数 ----------------------
 def train_online_dpo(epoch, train_loader, policy_gen, ref_gen, optimizer):
-    """训练：逐帧处理，限制每epoch样本数"""
     policy_gen.train()
     total_loss = 0.0
     optimized_count = 0
@@ -220,9 +231,9 @@ def train_online_dpo(epoch, train_loader, policy_gen, ref_gen, optimizer):
 
     for sample_idx, batch in pbar:
         if sample_idx >= config["max_train_samples_per_epoch"]:
-            break  # 训练时限制样本数
+            break
 
-        # 解包单样本数据
+        # 解包数据
         imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
         images = torch.stack([imgs1, imgs2], dim=2).to(device)
         future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(device)
@@ -230,21 +241,25 @@ def train_online_dpo(epoch, train_loader, policy_gen, ref_gen, optimizer):
         future_driver = future_driver.to(device)
         future_driver_last = future_driver[:, -1, :]
 
-        # 特征嵌入（无梯度）
+        # 特征嵌入
         with torch.no_grad():
             image_embedded = image_embed(images)
             motor_embedded = motor_embed(driver)
             future_image_embedded = image_embed(future_images)
             img_proj_future = img_sim_model(future_image_embedded)
 
-        # 生成动作候选
-        candidates = policy_gen(
+        # 生成动作候选（关键修复：解析模型返回的字典）
+        generator_output = policy_gen(  # 模型返回字典
             image_embedded=image_embedded,
             motor_embedded=motor_embedded,
             num_candidates=config["num_candidates"],
             temperature=1.0
         )
-        candidates = [cand.squeeze(1) for cand in candidates]
+        # 从字典中提取指定的候选列表（candidates1或candidates2）
+        candidates = generator_output[config["use_candidates"]]  # 现在是张量列表，形状正确
+
+        # 处理候选动作维度（移除多余的时间维度）
+        candidates = [cand.squeeze(1) for cand in candidates]  # 每个元素: (batch, motor_dim)
 
         # 选择偏好/非偏好动作
         preferred, rejected = select_preferred_rejected(
@@ -289,17 +304,15 @@ def train_online_dpo(epoch, train_loader, policy_gen, ref_gen, optimizer):
 
 
 def validate_full_dpo(val_loader, policy_gen, ref_gen):
-    """验证：遍历整个验证集，不限制样本数"""
     policy_gen.eval()
     total_loss = 0.0
-    sample_count = 0  # 记录验证的总样本数（全量）
+    sample_count = 0
 
     with torch.no_grad():
-        # 进度条：总样本数为验证集长度
         pbar = tqdm(enumerate(val_loader), desc="全量验证", total=len(val_loader))
 
         for sample_idx, batch in pbar:
-            # 解包单样本数据（与训练格式一致）
+            # 解包数据
             imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
             images = torch.stack([imgs1, imgs2], dim=2).to(device)
             future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(device)
@@ -313,14 +326,17 @@ def validate_full_dpo(val_loader, policy_gen, ref_gen):
             future_image_embedded = image_embed(future_images)
             img_proj_future = img_sim_model(future_image_embedded)
 
-            # 生成动作候选并选择偏好/非偏好动作
-            candidates = policy_gen(
+            # 生成动作候选（修复：解析字典）
+            generator_output = policy_gen(
                 image_embedded=image_embedded,
                 motor_embedded=motor_embedded,
                 num_candidates=config["num_candidates"],
                 temperature=1.0
             )
+            candidates = generator_output[config["use_candidates"]]  # 提取候选列表
             candidates = [cand.squeeze(1) for cand in candidates]
+
+            # 选择偏好/非偏好动作
             preferred, rejected = select_preferred_rejected(
                 candidates=candidates,
                 img_proj_future=img_proj_future,
@@ -343,7 +359,6 @@ def validate_full_dpo(val_loader, policy_gen, ref_gen):
                 "已验证样本": sample_count
             })
 
-    # 全量验证的平均损失
     avg_loss = total_loss / sample_count if sample_count > 0 else 0.0
     print(f"全量验证完成 | 总样本数：{sample_count} | 平均损失：{avg_loss:.4f}")
     return avg_loss, sample_count
@@ -370,13 +385,12 @@ def main():
         "train_loss": [],
         "val_loss": [],
         "train_optimized_samples": [],
-        "val_total_samples": []  # 记录验证集总样本数
+        "val_total_samples": []
     }
     best_val_loss = float("inf")
 
     print("\n" + "=" * 50)
-    print("开始训练（逐帧DPO）+ 验证（全量数据集）")
-    print(f"训练限制：每epoch最多{config['max_train_samples_per_epoch']}样本 | 验证：全量{len(val_loader)}样本")
+    print(f"开始训练 | 使用候选组：{config['use_candidates']}")
     print("=" * 50)
 
     # 训练循环
@@ -393,7 +407,7 @@ def main():
         )
         scheduler.step()
 
-        # 全量验证（遍历整个val数据集）
+        # 全量验证
         val_loss, val_total_samples = validate_full_dpo(
             val_loader=val_loader,
             policy_gen=policy_generator,
@@ -414,7 +428,7 @@ def main():
         print(f"验证：平均损失={val_loss:.4f}（总样本数={val_total_samples}）")
         print("=" * 30 + "\n")
 
-        # 保存最佳模型（基于全量验证损失）
+        # 保存最佳模型
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save({
@@ -439,3 +453,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
