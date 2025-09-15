@@ -21,7 +21,7 @@ print(f"使用设备: {device}")
 config = {
     # training parameters
     "batch_size": 4,
-    "epochs": 20,
+    "epochs": 100,
     "lr": 1e-5,
     # "weight_decay": 1e-5,
     "sampling_workers": 15,
@@ -145,7 +145,7 @@ def train_one_epoch(epoch):
     total_sim_loss = 0.0
     total_loss = 0.0
 
-    max_train_batches = 100  # 只训练前50个batch（按需调整）
+    max_train_batches = 10  # 只训练前50个batch（按需调整）
     batch_count = 0  # 计数当前epoch已训练的batch数
 
     pbar = tqdm(enumerate(train_loader), desc=f"训练 Epoch {epoch + 1}/{config['epochs']}",
@@ -223,9 +223,9 @@ def train_one_epoch(epoch):
         })
 
     # 计算平均损失
-    avg_gen_loss = total_gen_loss / len(train_dataset)
-    avg_sim_loss = total_sim_loss / len(train_dataset)
-    avg_total_loss = total_loss / len(train_dataset)
+    avg_gen_loss = total_gen_loss / min(max_train_batches, len(train_loader))
+    avg_sim_loss = total_sim_loss / min(max_train_batches, len(train_loader))
+    avg_total_loss = total_loss / min(max_train_batches, len(train_loader))
 
     return avg_total_loss, avg_gen_loss, avg_sim_loss
 
@@ -241,16 +241,16 @@ def validate_one_epoch(epoch):
     total_sim_loss = 0.0
     total_loss = 0.0
 
-    max_train_batches = 100  # 只训练前50个batch（按需调整）
+    max_val_batches = 10  # 只训练前50个batch（按需调整）
     batch_count = 0  # 计数当前epoch已训练的batch数
 
     pbar = tqdm(enumerate(val_loader), desc=f"验证 Epoch {epoch + 1}/{config['epochs']}",
-                total=min(max_train_batches, len(val_loader)))  # 进度条只显示到max_train_batches
+                total=min(max_val_batches, len(val_loader)))  # 进度条只显示到max_train_batches
     # 关闭梯度计算（加速验证，避免内存占用）
     with torch.no_grad():
         for batch_idx, batch in pbar:
-            if batch_count >= max_train_batches:
-                print(f"\n已验证{max_train_batches}个batch，提前终止当前epoch")
+            if batch_count >= max_val_batches:
+                print(f"\n已验证{max_val_batches}个batch，提前终止当前epoch")
                 break
             batch_count += 1  # 计数+1
 
@@ -298,9 +298,9 @@ def validate_one_epoch(epoch):
             })
 
     # 计算验证集平均损失
-    avg_gen_loss = total_gen_loss / len(val_loader)
-    avg_sim_loss = total_sim_loss / len(val_loader)
-    avg_total_loss = total_loss / len(val_loader)
+    avg_gen_loss = total_gen_loss / min(max_val_batches, len(val_loader))
+    avg_sim_loss = total_sim_loss / min(max_val_batches, len(val_loader))
+    avg_total_loss = total_loss / min(max_val_batches, len(val_loader))
     return avg_total_loss, avg_gen_loss, avg_sim_loss
 
 
