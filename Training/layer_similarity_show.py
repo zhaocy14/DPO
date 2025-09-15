@@ -29,7 +29,7 @@ CONFIG = {
     "gen_seq_len": 30,
     "sim_seq_len": 30,
     "data_root_dirs": '/data/cyzhao/collector_cydpo/dpo_data',
-    "trained_model_path": "./saved_models/key_layers_dpo_final_best_model",  # 训练好的模型路径
+    "trained_model_path": "./saved_models/best_model",  # 训练好的模型路径
     "similarity_save_path": "./layer_similarity_matrix.npy",  # 相似度矩阵保存路径
     "batch_size": 1  # 用于生成特征的批次大小
 }
