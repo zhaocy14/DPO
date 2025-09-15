@@ -7,6 +7,7 @@ father_path = os.path.abspath(os.path.dirname(pwd) + os.path.sep + "..")
 sys.path.append(father_path)
 import time
 import torch
+from torch import nn
 import numpy as np
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -20,7 +21,7 @@ from tqdm import tqdm
 
 
 # 设备初始化
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:01" if torch.cuda.is_available() else "cpu")
 print(f"[初始化] 使用设备: {device}")
 
 # ---------------------- 核心配置参数（新增关键层识别参数） ----------------------
