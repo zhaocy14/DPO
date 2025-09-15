@@ -33,7 +33,7 @@ config = {
     "batch_size": 4,
     "epochs": 100,
     "lr": 1e-5,
-    "sampling_workers": 15,
+    "sampling_workers": 20,
 
     # 生成器模型参数
     "embed_dim_gen": 128,
@@ -194,7 +194,7 @@ def train_one_epoch(epoch):
     total_sim_loss = 0.0
     total_loss = 0.0
 
-    max_train_batches = 10  # 限制训练批次（可根据需要调整）
+    max_train_batches = 20  # 限制训练批次（可根据需要调整）
     batch_count = 0
 
     pbar = tqdm(
@@ -297,7 +297,7 @@ def validate_one_epoch(epoch):
     total_sim_loss = 0.0
     total_loss = 0.0
 
-    max_val_batches = 10  # 限制验证批次
+    max_val_batches = 20  # 限制验证批次
     batch_count = 0
 
     pbar = tqdm(
