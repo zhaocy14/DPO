@@ -51,7 +51,7 @@ config = {
     "similarity_dim": 32,
 
     # 路径
-    "data_root_dirs": '/data/cyzhao/collector_cydpo/data_dpo',
+    "data_root_dirs": '/data/cyzhao/collector_cydpo/dpo_data',
     "pretrained_model_path": "./saved_models/best_model",
     "dpo_save_path": "./saved_models/dpo_fixed_dim_model",
     "dpo_loss_path": "./loss_records/dpo_fixed_dim_loss.npy"
