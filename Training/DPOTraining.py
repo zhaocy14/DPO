@@ -16,14 +16,14 @@ from tqdm import tqdm
 
 
 # 设备设置
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 print(f"使用设备: {device}")
 
 # ---------------------- 核心配置参数（删除use_candidates，适配单组动作） ----------------------
 CONFIG = {
     # 验证控制
-    "max_val_batches": 30,
-    "val_batch_size": 16,
+    "max_val_batches": 20,
+    "val_batch_size": 6,
 
     # 相似度加权系数
     "alpha": 0.9,
@@ -37,7 +37,7 @@ CONFIG = {
     "max_train_samples_per_epoch": 50,
     "dpo_beta": 0.1,
     "repeat_threshold": 0.97,
-    "history_cache_size": 10,
+    "history_cache_size": 2,
     # 【核心删除】移除use_candidates（不再区分candidates1/candidates2）
     "embed_dim_gen": 128,
     "nhead_gen": 8,

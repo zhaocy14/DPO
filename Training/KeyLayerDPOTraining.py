@@ -41,13 +41,13 @@ CONFIG = {
 
     "batch_size": 1,
     "epochs": 30,
-    "lr": 5e-6,
+    "lr": 5e-3,
     "num_candidates": 5,  # 单组候选动作数量
     "sampling_workers": 2,
     "max_train_samples_per_epoch": 50,
     "dpo_beta": 0.1,
     "repeat_threshold": 0.95,
-    "history_cache_size": 10,
+    "history_cache_size": 2,
     # 【核心删除】移除use_candidates（不再区分candidates1/candidates2）
     "embed_dim_gen": 128,
     "nhead_gen": 8,
