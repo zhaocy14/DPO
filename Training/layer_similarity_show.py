@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+# 路径配置（确保导入正常）
+pwd = os.path.abspath(os.path.abspath(__file__))
+father_path = os.path.abspath(os.path.dirname(pwd) + os.path.sep + "..")
+sys.path.append(father_path)
 import torch
 import numpy as np
 import torch.nn.functional as F
