@@ -27,8 +27,8 @@ print(f"[初始化] 使用设备: {device}")
 # ---------------------- 核心配置参数（新增关键层识别参数） ----------------------
 CONFIG = {
     # 验证控制
-    "max_val_batches": 50,
-    "val_batch_size": 8,
+    "max_val_batches": 30,
+    "val_batch_size": 16,
 
     # 相似度加权系数
     "alpha": 0.9,
@@ -40,7 +40,7 @@ CONFIG = {
     "similarity_threshold": 0.8,  # 80%相似度阈值
 
     "batch_size": 1,
-    "epochs": 50,
+    "epochs": 30,
     "lr": 5e-4,
     "num_candidates": 5,
     "sampling_workers": 2,

@@ -22,15 +22,15 @@ print(f"使用设备: {device}")
 # ---------------------- 核心配置参数 ----------------------
 CONFIG = {
     # 验证控制
-    "max_val_batches": 50,
-    "val_batch_size": 12,
+    "max_val_batches": 30,
+    "val_batch_size": 16,
 
     # 相似度加权系数
     "alpha": 0.9,
     "action_match_tolerance": 1e-4,  # 动作匹配的容差（处理浮点数精度）
 
     "batch_size": 1,
-    "epochs": 50,
+    "epochs": 30,
     "lr": 5e-4,
     "num_candidates": 5,
     "sampling_workers": 2,
