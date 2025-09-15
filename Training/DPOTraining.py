@@ -19,8 +19,11 @@ from tqdm import tqdm
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"使用设备: {device}")
 
-# ---------------------- 核心配置参数 ----------------------
+# ---------------------- 核心配置参数（新增alpha系数） ----------------------
 CONFIG = {
+    # 新增：相似度加权系数（0.9图像 + 0.1动作）
+    "alpha": 0.9,
+
     "batch_size": 1,
     "epochs": 5,
     "lr": 5e-7,
@@ -41,7 +44,7 @@ CONFIG = {
     "embed_dim_sim": 128,
     "num_layers_sim": 3,
     "nhead_sim": 4,
-    "similarity_dim": 32,  # cand_proj目标维度
+    "similarity_dim": 32,
     "data_root_dirs": '/data/cyzhao/collector_cydpo/dpo_data',
     "pretrained_model_path": "./saved_models/best_model",
     "dpo_save_path": "./saved_models/dpo_final_best_model",
@@ -173,7 +176,7 @@ def load_dataset():
     return train_loader, val_loader
 
 
-# ---------------------- 3. 核心工具函数（修复维度） ----------------------
+# ---------------------- 3. 核心工具函数（修改相似度计算） ----------------------
 def gaussian_log_prob(mean: torch.Tensor, std: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
     eps = 1e-6
     std = std + eps
@@ -211,7 +214,7 @@ def select_preferred_rejected(candidates: list[torch.Tensor],
                               future_driver_last: torch.Tensor,
                               motor_embed: MotorEmbedding) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    关键修复：挤压driver_sim_model输出的多余时间维度（dim=1）
+    核心修改：总相似度 = alpha*sim_img + (1-alpha)*sim_driver
     """
     # 1. 维度检查
     assert len(candidates) == CONFIG["num_candidates"], f"候选数={len(candidates)}，需为{CONFIG['num_candidates']}"
@@ -220,54 +223,41 @@ def select_preferred_rejected(candidates: list[torch.Tensor],
     assert future_driver_last.shape == (1,
                                         CONFIG["motor_dim"]), f"future_driver_last维度错误：{future_driver_last.shape}"
 
-    # 2. 候选动作嵌入（2→128维，含时间维度）
+    # 2. 候选动作嵌入
     candidate_embeddings = []
     for cand in candidates:
-        # 候选动作：(1,2) → 加时间维度：(1,1,2) → 嵌入：(1,1,128)
-        cand_with_seq = cand.unsqueeze(1)  # 必须加时间维度，匹配motor_embed输入
+        cand_with_seq = cand.unsqueeze(1)  # (1,1,2)
         emb = motor_embed(cand_with_seq)  # (1,1,128)
         candidate_embeddings.append(emb)
 
-    # 3. 计算图像相似度（修复核心：挤压多余时间维度）
+    # 3. 计算图像相似度
     sim_img = []
     for emb in candidate_embeddings:
-        # driver_sim_model输入：(1,1,128) → 输出：(1,1,32)（多了时间维度）
-        cand_proj = driver_sim_model(emb)
-        # 挤压时间维度dim=1：(1,1,32) → (1,32)（符合预期）
-        cand_proj = cand_proj.squeeze(1)
-        # 维度校验
-        assert cand_proj.shape == (1, CONFIG[
-            "similarity_dim"]), f"cand_proj维度错误：{cand_proj.shape}，需为(1,{CONFIG['similarity_dim']})"
-
-        # img_proj_future可能也含时间维度，一并挤压
+        cand_proj = driver_sim_model(emb).squeeze(1)  # (1,32)
         img_proj_future_squeezed = img_proj_future.squeeze(1)  # (1,32)
-        assert img_proj_future_squeezed.shape == (1, CONFIG[
-            "similarity_dim"]), f"img_proj_future维度错误：{img_proj_future_squeezed.shape}"
-
-        # 计算相似度（此时维度匹配）
         sim = F.cosine_similarity(cand_proj, img_proj_future_squeezed, dim=1)  # (1,)
-        sim_img.append(sim[0].item())  # 转标量
+        sim_img.append(sim[0].item())  # 标量值
 
-    # 4. 计算动作相似度（同样挤压时间维度）
-    # 未来动作：(1,2) → 加时间维度：(1,1,2) → 嵌入：(1,1,128) → 挤压：(1,128)
+    # 4. 计算动作相似度
     future_driver_with_seq = future_driver_last.unsqueeze(1)  # (1,1,2)
     future_driver_emb = motor_embed(future_driver_with_seq)  # (1,1,128)
-    future_emb_squeezed = future_driver_emb.squeeze(1)  # (1,128)（挤压时间维度）
+    future_emb_squeezed = future_driver_emb.squeeze(1)  # (1,128)
     future_norm = F.normalize(future_emb_squeezed, dim=1)  # (1,128)
 
     sim_driver = []
     for emb in candidate_embeddings:
-        emb_squeezed = emb.squeeze(1)  # (1,1,128) → (1,128)
+        emb_squeezed = emb.squeeze(1)  # (1,128)
         emb_norm = F.normalize(emb_squeezed, dim=1)  # (1,128)
         sim = F.cosine_similarity(emb_norm, future_norm, dim=1)  # (1,)
-        sim_driver.append(sim[0].item())
+        sim_driver.append(sim[0].item())  # 标量值
 
-    # 5. 综合排序
-    sim_total = torch.tensor(sim_img, device=device) + torch.tensor(sim_driver, device=device)  # (5,)
+    # 5. 核心修改：带alpha系数的加权求和（0.9*图像 + 0.1*动作）
+    alpha = CONFIG["alpha"]
+    sim_total = alpha * torch.tensor(sim_img, device=device) + (1 - alpha) * torch.tensor(sim_driver, device=device)
     preferred_idx = sim_total.argmax().item()
     rejected_idx = sim_total.argmin().item()
 
-    # 6. 提取动作（移除batch维度）
+    # 6. 提取动作
     preferred = candidates[preferred_idx].squeeze(0)  # (2,)
     rejected = candidates[rejected_idx].squeeze(0)  # (2,)
     return preferred, rejected
@@ -342,7 +332,7 @@ def train_one_epoch(epoch: int,
         future_driver = future_driver.to(device)
         future_driver_last = future_driver[:, -1, :]  # (1,2)
 
-        # 特征嵌入（img_proj_future可能含时间维度，后续处理）
+        # 特征嵌入
         with torch.no_grad():
             image_embedded = image_embed(images)  # (1,30,256)
             motor_embedded = motor_embed(driver)  # (1,30,128)
@@ -359,7 +349,7 @@ def train_one_epoch(epoch: int,
         candidates = generator_output[CONFIG["use_candidates"]]  # 列表：(1,1,2)×5
         candidates = [cand.squeeze(1) for cand in candidates]  # 每个：(1,2)
 
-        # 选择偏好/非偏好动作（内部处理维度）
+        # 选择偏好/非偏好动作
         preferred, rejected = select_preferred_rejected(
             candidates=candidates,
             img_proj_future=img_proj_future,
@@ -445,7 +435,7 @@ def validate_full(epoch: int,
             candidates = generator_output[CONFIG["use_candidates"]]
             candidates = [cand.squeeze(1) for cand in candidates]
 
-            # 选择动作（内部处理维度）
+            # 选择动作
             preferred, rejected = select_preferred_rejected(
                 candidates=candidates,
                 img_proj_future=img_proj_future,
@@ -479,8 +469,9 @@ def validate_full(epoch: int,
 def main():
     start_total_time = time.time()
     print("\n" + "=" * 60)
-    print("                      EncoderOnlyCandidateGenerator DPO优化（最终修复版）")
+    print("                      EncoderOnlyCandidateGenerator DPO优化（带alpha系数）")
     print("=" * 60)
+    print(f"[配置信息] 相似度加权系数：alpha={CONFIG['alpha']}（图像占比），1-alpha={1 - CONFIG['alpha']}（动作占比）")
 
     # 加载模型和数据
     try:
@@ -566,7 +557,7 @@ def main():
                 "policy_generator_state_dict": policy_generator.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
-                "config": CONFIG,
+                "config": CONFIG,  # 保存配置（含alpha）
                 "loss_records": loss_records
             }, CONFIG["dpo_save_path"])
             print(f"  - ✅ 保存最佳模型至：{CONFIG['dpo_save_path']}")
@@ -580,6 +571,7 @@ def main():
     print("=" * 60)
     print(f"总耗时：{total_time:.2f}秒 | 最佳验证损失：{best_val_loss:.4f}")
     print(f"模型路径：{CONFIG['dpo_save_path']} | 损失记录：{CONFIG['dpo_loss_path']}")
+    print(f"使用的相似度系数：alpha={CONFIG['alpha']}")
     print("=" * 60)
 
 
