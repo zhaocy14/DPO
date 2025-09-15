@@ -14,10 +14,6 @@ from Model.Models import (ImageEmbedding, MotorEmbedding,
                           SimilarityModelImage, SimilarityModelDriver)
 from tqdm import tqdm
 
-# 路径配置
-pwd = os.path.abspath(os.path.abspath(__file__))
-father_path = os.path.abspath(os.path.dirname(pwd) + os.path.sep + "..")
-sys.path.append(father_path)
 
 # 设备设置
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -25,7 +21,7 @@ print(f"使用设备: {device}")
 
 # ---------------------- 1. 配置参数 ----------------------
 config = {
-    # 训练参数（逐帧处理）
+    # 训练参数
     "batch_size": 1,
     "epochs": 5,
     "lr": 5e-7,
@@ -33,20 +29,20 @@ config = {
     "sampling_workers": 2,
     "max_train_samples_per_epoch": 500,
 
-    # 验证参数（全量验证）
+    # 验证参数
     "val_batch_size": 1,
 
-    # 标准DPO参数
+    # DPO参数
     "dpo_beta": 0.1,
     "repeat_threshold": 0.95,
     "history_cache_size": 10,
-    "use_candidates": "candidates1",  # 选择使用哪组候选动作（candidates1或candidates2）
+    "use_candidates": "candidates1",
 
-    # 模型参数（与提供的EncoderOnlyCandidateGenerator匹配）
-    "embed_dim_gen": 128,
+    # 模型参数（关键：motor_dim=2，embed_dim_gen=128）
+    "embed_dim_gen": 128,  # driver_sim_model期望的输入维度
     "nhead_gen": 8,
     "num_layers_gen": 16,
-    "motor_dim": 2,
+    "motor_dim": 2,  # 原始动作维度
     "gen_seq_len": 30,
     "sim_seq_len": 30,
     "embed_dim_sim": 128,
@@ -55,10 +51,10 @@ config = {
     "similarity_dim": 32,
 
     # 路径
-    "data_root_dirs": '/data/cyzhao/collector_cydpo/dpo_data',
+    "data_root_dirs": '/data/cyzhao/collector_cydpo',
     "pretrained_model_path": "./saved_models/best_model",
-    "dpo_save_path": "./saved_models/dpo_fixed_best_model",
-    "dpo_loss_path": "./loss_records/dpo_fixed_loss.npy"
+    "dpo_save_path": "./saved_models/dpo_fixed_dim_model",
+    "dpo_loss_path": "./loss_records/dpo_fixed_dim_loss.npy"
 }
 
 os.makedirs(os.path.dirname(config["dpo_save_path"]), exist_ok=True)
@@ -68,7 +64,8 @@ os.makedirs(os.path.dirname(config["dpo_loss_path"]), exist_ok=True)
 # ---------------------- 2. 模型加载 ----------------------
 def load_models_with_reference(pretrained_path):
     image_embed = ImageEmbedding(embed_dim=config["embed_dim_gen"], num_layers=3, is_resnet=False).to(device)
-    motor_embed = MotorEmbedding(motor_dim=config["motor_dim"], embed_dim=config["embed_dim_gen"]).to(device)
+    motor_embed = MotorEmbedding(motor_dim=config["motor_dim"], embed_dim=config["embed_dim_gen"]).to(
+        device)  # 将2维动作转为128维嵌入
     policy_generator = EncoderOnlyCandidateGenerator(
         embed_dim=config["embed_dim_gen"],
         nhead=config["nhead_gen"],
@@ -155,18 +152,16 @@ def gaussian_log_prob(mean, std, action):
 
 
 def get_generator_distribution(generator, image_embedded, motor_embedded, use_candidates):
-    """获取生成器输出的分布参数（适配模型返回的字典结构）"""
     combined = torch.cat([motor_embedded, image_embedded], dim=-1)
     combined = generator.positional_encoding(combined)
     encoder_out = generator.encoder(combined)
     encoder_out = encoder_out[-1]
     global_feat = encoder_out.mean(dim=1)
 
-    # 根据配置选择对应的均值和标准差（candidates1或candidates2）
     if use_candidates == "candidates1":
         mean = generator.fc_mean1(global_feat)
         logvar = generator.fc_logvar1(global_feat)
-    else:  # candidates2
+    else:
         mean = generator.fc_mean2(global_feat)
         logvar = generator.fc_logvar2(global_feat)
 
@@ -175,11 +170,29 @@ def get_generator_distribution(generator, image_embedded, motor_embedded, use_ca
     return mean, std
 
 
-def select_preferred_rejected(candidates, img_proj_future, future_driver_last):
-    candidate_projs = [driver_sim_model(cand) for cand in candidates]
+def select_preferred_rejected(candidates, img_proj_future, future_driver_last, motor_embed):
+    """修复：通过motor_embed将动作转换为嵌入维度（2→128）"""
+    # 1. 候选动作先经过motor_embed转换维度（关键修复）
+    # 原始候选动作：(batch, motor_dim=2) → 嵌入后：(batch, seq_len=1, embed_dim=128)
+    candidate_embeddings = [motor_embed(cand.unsqueeze(1)) for cand in candidates]
+    # 2. 再输入到driver_sim_model（此时维度匹配）
+    candidate_projs = [driver_sim_model(emb) for emb in candidate_embeddings]
+
+    # 3. 未来动作也需要同样处理（保持维度一致）
+    future_driver_emb = motor_embed(future_driver_last.unsqueeze(1))  # (batch, 1, 128)
+    future_norm = F.normalize(future_driver_emb.squeeze(1), dim=1)  # 移除时间维度
+
+    # 4. 计算动作相似度（使用嵌入后的数据）
+    sim_driver = []
+    for emb in candidate_embeddings:
+        emb_norm = F.normalize(emb.squeeze(1), dim=1)  # (batch, 128)
+        sim = F.cosine_similarity(emb_norm, future_norm, dim=1)  # (batch,)
+        sim_driver.append(sim)
+
+    # 5. 图像相似度计算（保持不变）
     sim_img = [F.cosine_similarity(cand_proj, img_proj_future, dim=1) for cand_proj in candidate_projs]
-    future_norm = F.normalize(future_driver_last, dim=1)
-    sim_driver = [F.cosine_similarity(F.normalize(cand, dim=1), future_norm, dim=1) for cand in candidates]
+
+    # 6. 综合排序
     sim_total = torch.tensor(sim_img, device=device) + torch.tensor(sim_driver, device=device)
     preferred_idx = sim_total.argmax().item()
     rejected_idx = sim_total.argmin().item()
@@ -199,14 +212,12 @@ def is_action_repeated(current_action, history_actions):
 
 
 def standard_dpo_loss(policy_gen, ref_gen, image_embedded, motor_embedded, preferred, rejected):
-    # 策略模型概率（使用配置指定的候选组）
     policy_mean, policy_std = get_generator_distribution(
         policy_gen, image_embedded, motor_embedded, config["use_candidates"]
     )
     log_p_theta_pref = gaussian_log_prob(policy_mean, policy_std, preferred.unsqueeze(0))
     log_p_theta_rej = gaussian_log_prob(policy_mean, policy_std, rejected.unsqueeze(0))
 
-    # 参考模型概率
     with torch.no_grad():
         ref_mean, ref_std = get_generator_distribution(
             ref_gen, image_embedded, motor_embedded, config["use_candidates"]
@@ -214,13 +225,12 @@ def standard_dpo_loss(policy_gen, ref_gen, image_embedded, motor_embedded, prefe
         log_p_ref_pref = gaussian_log_prob(ref_mean, ref_std, preferred.unsqueeze(0))
         log_p_ref_rej = gaussian_log_prob(ref_mean, ref_std, rejected.unsqueeze(0))
 
-    # 计算损失
     advantage = (log_p_theta_pref - log_p_ref_pref) - (log_p_theta_rej - log_p_ref_rej)
     return -F.logsigmoid(config["dpo_beta"] * advantage).mean()
 
 
 # ---------------------- 5. 训练/验证函数 ----------------------
-def train_online_dpo(epoch, train_loader, policy_gen, ref_gen, optimizer):
+def train_online_dpo(epoch, train_loader, policy_gen, ref_gen, optimizer, motor_embed):
     policy_gen.train()
     total_loss = 0.0
     optimized_count = 0
@@ -239,7 +249,7 @@ def train_online_dpo(epoch, train_loader, policy_gen, ref_gen, optimizer):
         future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(device)
         driver = driver.to(device)
         future_driver = future_driver.to(device)
-        future_driver_last = future_driver[:, -1, :]
+        future_driver_last = future_driver[:, -1, :]  # 原始动作：(batch, motor_dim=2)
 
         # 特征嵌入
         with torch.no_grad():
@@ -248,24 +258,22 @@ def train_online_dpo(epoch, train_loader, policy_gen, ref_gen, optimizer):
             future_image_embedded = image_embed(future_images)
             img_proj_future = img_sim_model(future_image_embedded)
 
-        # 生成动作候选（关键修复：解析模型返回的字典）
-        generator_output = policy_gen(  # 模型返回字典
+        # 生成动作候选
+        generator_output = policy_generator(
             image_embedded=image_embedded,
             motor_embedded=motor_embedded,
             num_candidates=config["num_candidates"],
             temperature=1.0
         )
-        # 从字典中提取指定的候选列表（candidates1或candidates2）
-        candidates = generator_output[config["use_candidates"]]  # 现在是张量列表，形状正确
+        candidates = generator_output[config["use_candidates"]]
+        candidates = [cand.squeeze(1) for cand in candidates]  # 每个候选：(batch, motor_dim=2)
 
-        # 处理候选动作维度（移除多余的时间维度）
-        candidates = [cand.squeeze(1) for cand in candidates]  # 每个元素: (batch, motor_dim)
-
-        # 选择偏好/非偏好动作
+        # 选择偏好/非偏好动作（传入motor_embed用于维度转换）
         preferred, rejected = select_preferred_rejected(
             candidates=candidates,
             img_proj_future=img_proj_future,
-            future_driver_last=future_driver_last
+            future_driver_last=future_driver_last,
+            motor_embed=motor_embed  # 关键：传入嵌入模型
         )
 
         # 重复动作跳过优化
@@ -303,7 +311,7 @@ def train_online_dpo(epoch, train_loader, policy_gen, ref_gen, optimizer):
     return avg_loss, optimized_count
 
 
-def validate_full_dpo(val_loader, policy_gen, ref_gen):
+def validate_full_dpo(val_loader, policy_gen, ref_gen, motor_embed):
     policy_gen.eval()
     total_loss = 0.0
     sample_count = 0
@@ -326,21 +334,22 @@ def validate_full_dpo(val_loader, policy_gen, ref_gen):
             future_image_embedded = image_embed(future_images)
             img_proj_future = img_sim_model(future_image_embedded)
 
-            # 生成动作候选（修复：解析字典）
-            generator_output = policy_gen(
+            # 生成动作候选
+            generator_output = policy_generator(
                 image_embedded=image_embedded,
                 motor_embedded=motor_embedded,
                 num_candidates=config["num_candidates"],
                 temperature=1.0
             )
-            candidates = generator_output[config["use_candidates"]]  # 提取候选列表
+            candidates = generator_output[config["use_candidates"]]
             candidates = [cand.squeeze(1) for cand in candidates]
 
             # 选择偏好/非偏好动作
             preferred, rejected = select_preferred_rejected(
                 candidates=candidates,
                 img_proj_future=img_proj_future,
-                future_driver_last=future_driver_last
+                future_driver_last=future_driver_last,
+                motor_embed=motor_embed
             )
 
             # 计算验证损失
@@ -367,7 +376,7 @@ def validate_full_dpo(val_loader, policy_gen, ref_gen):
 # ---------------------- 6. Main函数 ----------------------
 def main():
     # 加载模型和数据
-    global image_embed, motor_embed, img_sim_model, driver_sim_model
+    global image_embed, motor_embed, img_sim_model, driver_sim_model, policy_generator
     image_embed, motor_embed, policy_generator, ref_generator, img_sim_model, driver_sim_model = load_models_with_reference(
         config["pretrained_model_path"]
     )
@@ -390,20 +399,21 @@ def main():
     best_val_loss = float("inf")
 
     print("\n" + "=" * 50)
-    print(f"开始训练 | 使用候选组：{config['use_candidates']}")
+    print(f"开始训练 | 动作维度：{config['motor_dim']} → 嵌入维度：{config['embed_dim_gen']}")
     print("=" * 50)
 
     # 训练循环
     for epoch in range(config["epochs"]):
         epoch_start = time.time()
 
-        # 逐帧训练
+        # 逐帧训练（传入motor_embed用于维度转换）
         train_loss, optimized_samples = train_online_dpo(
             epoch=epoch,
             train_loader=train_loader,
             policy_gen=policy_generator,
             ref_gen=ref_generator,
-            optimizer=optimizer
+            optimizer=optimizer,
+            motor_embed=motor_embed  # 关键：传入嵌入模型
         )
         scheduler.step()
 
@@ -411,7 +421,8 @@ def main():
         val_loss, val_total_samples = validate_full_dpo(
             val_loader=val_loader,
             policy_gen=policy_generator,
-            ref_gen=ref_generator
+            ref_gen=ref_generator,
+            motor_embed=motor_embed
         )
 
         # 记录损失
