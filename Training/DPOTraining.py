@@ -30,13 +30,13 @@ CONFIG = {
     "action_match_tolerance": 1e-4,  # 动作匹配的容差（处理浮点数精度）
 
     "batch_size": 1,
-    "epochs": 10,
-    "lr": 5e-7,
+    "epochs": 50,
+    "lr": 5e-4,
     "num_candidates": 5,
     "sampling_workers": 2,
-    "max_train_samples_per_epoch": 500,
+    "max_train_samples_per_epoch": 100,
     "dpo_beta": 0.1,
-    "repeat_threshold": 0.97,
+    "repeat_threshold": 0.9,
     "history_cache_size": 10,
     "use_candidates": "candidates1",
     "embed_dim_gen": 128,
@@ -619,7 +619,7 @@ def main():
         )
 
         # 学习率调度
-        scheduler.step()
+        # scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
 
         # 验证（获取匹配统计）
