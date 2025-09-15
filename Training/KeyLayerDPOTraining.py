@@ -61,8 +61,8 @@ CONFIG = {
     "similarity_dim": 32,
     "data_root_dirs": '/data/cyzhao/collector_cydpo/dpo_data',
     "pretrained_model_path": "./saved_models/best_model",
-    "dpo_save_path": "./saved_models/dpo_final_best_model",
-    "dpo_loss_path": "./loss_records/dpo_final_loss.npy",
+    "dpo_save_path": "./saved_models/key_layers_dpo_final_best_model",
+    "dpo_loss_path": "./loss_records/key_layers_dpo_final_loss.npy",
     "key_layers_record_path": "./loss_records/key_layers_history.npy"  # 记录关键层历史
 }
 
