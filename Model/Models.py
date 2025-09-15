@@ -1,17 +1,18 @@
-import os,sys
-pwd = os.path.abspath(os.path.abspath(__file__))
-father_path = os.path.abspath(os.path.dirname(pwd) + os.path.sep + "..")
-sys.path.append(father_path)
+import os
+import sys
 import time
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet18
 from torchvision.models import ResNet18_Weights
 
+# 路径配置（确保导入正常）
+pwd = os.path.abspath(os.path.abspath(__file__))
+father_path = os.path.abspath(os.path.dirname(pwd) + os.path.sep + "..")
+sys.path.append(father_path)
 
-# 复用之前定义的ImageEmbedding和MotorEmbedding
+
 class ImageEmbedding(nn.Module):
     def __init__(self, embed_dim=64, c=256, num_layers=3, dropout_rate=0.5, is_resnet=False):
         super(ImageEmbedding, self).__init__()
@@ -26,9 +27,10 @@ class ImageEmbedding(nn.Module):
             self.cnn_layers = nn.ModuleList()
             self.residual_layers = nn.ModuleList()
             in_channels = 3
-            out_channels = 16  # 初始输出通道设为16
+            out_channels = 16  # 固定输出通道，避免维度膨胀
 
             for i in range(num_layers):
+                # 卷积块（3层卷积+BN+ReLU）
                 self.cnn_layers.append(nn.Sequential(
                     nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
                     nn.BatchNorm2d(out_channels),
@@ -41,42 +43,52 @@ class ImageEmbedding(nn.Module):
                     nn.ReLU()
                 ))
 
+                # 残差连接（通道不匹配时用1x1卷积调整）
                 if in_channels != out_channels:
                     self.residual_layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=1))
                 else:
                     self.residual_layers.append(None)
 
+                # 下采样+ dropout
                 self.cnn_layers.append(nn.Sequential(
                     nn.MaxPool2d(kernel_size=2, stride=2),
                     nn.Dropout2d(dropout_rate)
                 ))
 
-                in_channels = out_channels  # 不再将out_channels翻倍，保持16不变
+                in_channels = out_channels  # 更新输入通道
 
+            # 全连接层输入维度计算（根据下采样次数）
             h, w = c // (2 ** num_layers), c // (2 ** num_layers)
             self.fc = nn.Linear(in_channels * h * w, embed_dim)
 
     def forward(self, images):
+        # 输入形状：(batch, seq, num_cameras, 3, H, W) → 展平为2D图像用于CNN
         batch_size, seq_length, num_cameras, channels, H, W = images.shape
-        images = images.view(-1, channels, H, W)
-        images = F.interpolate(images, size=(self.c, self.c), mode='bilinear', align_corners=False)
+        images_flat = images.view(-1, channels, H, W)  # (batch*seq*num_cameras, 3, H, W)
 
-        out = images
+        # 统一图像尺寸到指定大小
+        images_flat = F.interpolate(images_flat, size=(self.c, self.c), mode='bilinear', align_corners=False)
+
         if not self.is_resnet:
+            out = images_flat
             for i in range(len(self.residual_layers)):
+                # 残差连接计算
                 residual = out
-                out = self.cnn_layers[2 * i](out)
+                out = self.cnn_layers[2 * i](out)  # 卷积块
                 if self.residual_layers[i] is not None:
                     residual = self.residual_layers[i](residual)
-                out = out + residual
-                out = self.cnn_layers[2 * i + 1](out)
-            out = out.view(batch_size * seq_length * num_cameras, -1)
-            embedded = self.fc(out)
+                out = out + residual  # 残差相加
+                out = self.cnn_layers[2 * i + 1](out)  # 下采样+dropout
+            # 展平后过全连接层
+            out_flat = out.view(batch_size * seq_length * num_cameras, -1)
+            embedded = self.fc(out_flat)
         else:
-            embedded = self.resnet(out)
+            # ResNet直接提取特征
+            embedded = self.resnet(images_flat)
 
+        # 恢复维度：(batch, seq, num_cameras*embed_dim) → 双摄像头时为2*embed_dim
         embedded = embedded.view(batch_size, seq_length, num_cameras, -1)
-        embedded = embedded.view(batch_size, seq_length, -1)  # (batch, seq, 2*embed_dim)
+        embedded = embedded.view(batch_size, seq_length, -1)  # 最终形状：(batch, seq, 2*embed_dim)
         return embedded
 
 
@@ -85,174 +97,153 @@ class MotorEmbedding(nn.Module):
         super(MotorEmbedding, self).__init__()
         self.fc_layers = nn.ModuleList()
         in_dim = motor_dim
-        hidden_dim = 16
+        hidden_dim = 16  # 隐藏层维度
 
+        # 堆叠全连接层
         for _ in range(num_fc_layers):
             self.fc_layers.append(nn.Linear(in_dim, hidden_dim))
             self.fc_layers.append(nn.ReLU())
             self.fc_layers.append(nn.Dropout(dropout_rate))
             in_dim = hidden_dim
 
+        # 输出层（映射到目标嵌入维度）
         self.fc_layers.append(nn.Linear(in_dim, embed_dim))
 
     def forward(self, motor_data):
+        # 输入形状支持：(batch, motor_dim) 或 (batch, seq, motor_dim)
+        out = motor_data
         for layer in self.fc_layers:
-            motor_data = layer(motor_data)
-        return motor_data
+            out = layer(out)
+        return out  # 输出形状：(batch, embed_dim) 或 (batch, seq, embed_dim)
 
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super(PositionalEncoding, self).__init__()
+        # 预计算位置编码（注册为缓冲区，不参与训练）
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+
+        # 偶数维度用sin，奇数维度用cos
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
+        self.register_buffer('pe', pe.unsqueeze(0))  # 形状：(1, max_len, d_model)
 
     def forward(self, x):
+        # x形状：(batch, seq_len, d_model)
         seq_length = x.size(1)
+        # 取对应长度的位置编码并重复到batch维度
         pe = self.pe[:, :seq_length, :].repeat(x.size(0), 1, 1)
-        x = x + pe
+        x = x + pe  # 位置编码与输入相加
         return x
+
 
 class TransformerEncoderModel(nn.Module):
     def __init__(self, embed_dim=64, nhead=8, num_layers=16):
         super(TransformerEncoderModel, self).__init__()
-        # 存储每一层的编码器
+        self.d_model = embed_dim * 3  # 固定：motor_embed(1*dim) + image_embed(2*dim)
+        # 堆叠Transformer编码器层
         self.layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(d_model=embed_dim * 3, nhead=nhead, batch_first=True)
+            nn.TransformerEncoderLayer(d_model=self.d_model, nhead=nhead, batch_first=True)
             for _ in range(num_layers)
         ])
-        # 为每一层创建训练控制开关，默认都参与训练
+        # 层训练开关（默认全部参与训练）
         self.layer_trainable = nn.Parameter(torch.ones(num_layers, dtype=torch.bool), requires_grad=False)
 
     def set_layer_trainable(self, layer_idx, trainable):
-        """设置指定层是否参与训练"""
+        """设置指定层是否参与训练（边界检查）"""
         if 0 <= layer_idx < len(self.layers):
             self.layer_trainable[layer_idx] = trainable
 
     def forward(self, src):
-        """返回每一层的输出结果列表"""
+        # src形状：(batch, seq_len, d_model)
         layer_outputs = []
         current = src
 
         for i, layer in enumerate(self.layers):
-            # 根据开关决定是否让该层参与训练
+            # 根据开关决定是否计算梯度
             if self.layer_trainable[i]:
-                # 该层参与训练，正常计算
                 current = layer(current)
             else:
-                # 该层不参与训练，关闭梯度计算
                 with torch.no_grad():
                     current = layer(current)
+            layer_outputs.append(current)  # 保存每一层的输出
 
-            # 保存当前层的输出
-            layer_outputs.append(current)
-
-        return layer_outputs  # 返回所有层的输出列表，最后一个元素是最终输出
+        return layer_outputs  # 返回所有层输出，最后一个为最终输出
 
 
 class EncoderOnlyCandidateGenerator(nn.Module):
+    """
+    修正核心：只生成一组动作参数（对应2个电机的动作值）
+    输出：(batch, motor_dim=2) 的均值/标准差 + 多个候选动作
+    """
+
     def __init__(self, embed_dim, nhead, num_layers, motor_dim=2, max_seq_length=100):
         super().__init__()
-        self.d_model = embed_dim * 3  # 融合后的特征维度
+        self.d_model = embed_dim * 3  # motor_embed(1*dim) + image_embed(2*dim)
+        self.motor_dim = motor_dim  # 固定为2（两个电机）
         self.positional_encoding = PositionalEncoding(self.d_model, max_seq_length)
         self.encoder = TransformerEncoderModel(embed_dim, nhead, num_layers)
 
-        # 输出层：为两种数据分别预测分布参数
-        # 第一组数据的分布参数
-        self.fc_mean1 = nn.Linear(self.d_model, motor_dim)  # 第一组均值
-        self.fc_logvar1 = nn.Linear(self.d_model, motor_dim)  # 第一组对数方差
-
-        # 第二组数据的分布参数
-        self.fc_mean2 = nn.Linear(self.d_model, motor_dim)  # 第二组均值
-        self.fc_logvar2 = nn.Linear(self.d_model, motor_dim)  # 第二组对数方差
+        # 【核心修改】只保留一组分布参数输出层（删除mean2/std2相关）
+        self.fc_mean = nn.Linear(self.d_model, motor_dim)  # 动作均值预测（2维）
+        self.fc_logvar = nn.Linear(self.d_model, motor_dim)  # 动作对数方差预测（2维）
 
     def forward(self, image_embedded, motor_embedded, num_candidates=5, temperature=0.5):
         """
-        生成多个1帧动作候选，返回两组数据及其分布参数
-        :param image_embedded: 图像嵌入 (batch, seq, 2*embed_dim)
-        :param motor_embedded: 历史电机嵌入 (batch, seq, embed_dim)
-        :param num_candidates: 候选数量
-        :param temperature: 温度参数（控制采样随机性，>0，越小越集中）
-        :return: 两组候选动作列表及对应的均值和标准差
+        输入：
+            image_embedded: (batch, seq, 2*embed_dim) → 双摄像头图像嵌入
+            motor_embedded: (batch, seq, embed_dim)   → 历史电机动作嵌入
+        输出：
+            dict: 包含候选动作列表、均值、标准差
         """
-        # 1. 融合输入特征
+        # 1. 融合图像和电机特征（维度：3*embed_dim）
         combined = torch.cat([motor_embedded, image_embedded], dim=-1)  # (batch, seq, 3*embed_dim)
-        combined = self.positional_encoding(combined)  # 加位置编码
+        combined = self.positional_encoding(combined)  # 加入位置编码
 
-        # 2. Encoder提取全局特征
-        encoder_out = self.encoder(combined)  # (batch, seq, 3*embed_dim)
-        encoder_out = encoder_out[-1]
-        global_feat = encoder_out.mean(dim=1)  # 取序列均值作为全局特征 (batch, 3*embed_dim)
+        # 2. Transformer编码器提取全局特征
+        encoder_out_list = self.encoder(combined)  # 所有层输出列表
+        encoder_final_out = encoder_out_list[-1]  # 最后一层输出（最终特征）
+        global_feat = encoder_final_out.mean(dim=1)  # 序列维度取平均 → (batch, 3*embed_dim)
 
-        # 3. 预测第一组数据的分布参数（均值+标准差）
-        mean1 = self.fc_mean1(global_feat)  # (batch, motor_dim)
-        logvar1 = self.fc_logvar1(global_feat)  # (batch, motor_dim)
-        logvar1 = torch.clamp(logvar1, min=-5, max=5)
-        std1 = torch.exp(0.5 * logvar1) * temperature  # 温度调整标准差
+        # 3. 预测动作分布参数（均值+标准差）
+        mean = self.fc_mean(global_feat)  # (batch, motor_dim=2) → 两个电机的均值
+        logvar = self.fc_logvar(global_feat)  # (batch, motor_dim=2) → 两个电机的对数方差
 
-        # 预测第二组数据的分布参数（均值+标准差）
-        mean2 = self.fc_mean2(global_feat)  # (batch, motor_dim)
-        logvar2 = self.fc_logvar2(global_feat)  # (batch, motor_dim)
-        logvar2 = torch.clamp(logvar2, min=-5, max=5)
-        std2 = torch.exp(0.5 * logvar2) * temperature  # 温度调整标准差
+        # 限制对数方差范围，避免标准差过大/过小
+        logvar = torch.clamp(logvar, min=-5, max=5)
+        std = torch.exp(0.5 * logvar) * temperature  # 标准差（温度调整随机性）
 
-        # 4. 从高斯分布中多次采样，生成候选，并使用tanh限制在[-1, 1]
-        candidates1 = []
-        candidates2 = []
+        # 4. 生成多个候选动作（从高斯分布采样）
+        candidates = []
         for _ in range(num_candidates):
-            # 第一组采样
-            eps1 = torch.randn_like(mean1)  # 标准正态分布噪声
-            sample1 = mean1 + std1 * eps1  # (batch, motor_dim)
-            sample1 = torch.tanh(sample1)  # 将输出限制在[-1, 1]之间
-            candidates1.append(sample1.unsqueeze(1))  # 增加时间维度 (batch, 1, motor_dim)
+            eps = torch.randn_like(mean)  # 标准正态噪声 → (batch, 2)
+            sample = mean + std * eps  # 重参数化采样
+            sample = torch.tanh(sample)  # 限制动作范围到[-1,1]
+            sample = sample.unsqueeze(1)  # 增加时间维度 → (batch, 1, 2)
+            candidates.append(sample)
 
-            # 第二组采样
-            eps2 = torch.randn_like(mean2)  # 标准正态分布噪声
-            sample2 = mean2 + std2 * eps2  # (batch, motor_dim)
-            sample2 = torch.tanh(sample2)  # 将输出限制在[-1, 1]之间
-            candidates2.append(sample2.unsqueeze(1))  # 增加时间维度 (batch, 1, motor_dim)
-
-        # 返回两组候选以及它们的均值和标准差
+        # 【核心修改】只返回一组参数（删除candidates2/mean2/std2）
         return {
-            'candidates1': candidates1,
-            'mean1': mean1,
-            'std1': std1,
-            'candidates2': candidates2,
-            'mean2': mean2,
-            'std2': std2
+            'candidates': candidates,  # 候选动作列表：[ (batch,1,2), ... ]
+            'mean': mean,  # 动作均值：(batch, 2)
+            'std': std  # 动作标准差：(batch, 2)
         }
-
-# 新增：计算模型大小的函数
-def calculate_model_size(model):
-    """计算模型参数和缓冲区的总大小（MB）"""
-    # 计算参数大小
-    param_size = sum(p.numel() * p.element_size() for p in model.parameters())
-    # 计算缓冲区大小（如positional encoding中的pe）
-    buffer_size = sum(b.numel() * b.element_size() for b in model.buffers())
-    # 转换为MB（1MB = 1024^2字节）
-    total_size = (param_size + buffer_size) / (1024 ** 2)
-    return total_size
 
 
 class SimilarityModelImage(nn.Module):
-    """
-    处理连续几帧的两张图像embedding的投射模型
-    使用Transformer encoder + 全连接层
-    """
+    """处理连续帧图像嵌入的投射模型（输入已拼接双摄像头特征）"""
 
     def __init__(self, embed_dim=128, num_frames=30, num_layers=3, nhead=4, similarity_dim=128):
         super(SimilarityModelImage, self).__init__()
-        self.embed_dim = embed_dim * 2
+        self.input_dim = embed_dim * 2  # 双摄像头图像嵌入维度（2*embed_dim）
         self.num_frames = num_frames
-        self.positional_encoding = PositionalEncoding(self.embed_dim, max_len=num_frames)
+        self.positional_encoding = PositionalEncoding(self.input_dim, max_len=num_frames)
 
-        # Transformer编码器层
+        # Transformer编码器（提取时序特征）
         self.transformer_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim,
+            d_model=self.input_dim,
             nhead=nhead,
             batch_first=True
         )
@@ -261,40 +252,34 @@ class SimilarityModelImage(nn.Module):
             num_layers=num_layers
         )
 
-        # 全连接层，将输出映射到相似度空间
+        # 全连接层（映射到相似度空间）
         self.fc = nn.Sequential(
-            nn.Linear(self.embed_dim, self.embed_dim // 2),
+            nn.Linear(self.input_dim, self.input_dim // 2),
             nn.ReLU(),
-            nn.Linear(self.embed_dim // 2, similarity_dim)
+            nn.Linear(self.input_dim // 2, similarity_dim)
         )
 
     def forward(self, imgs_embedding):
         """
-        已经打包的两张图像嵌入序列
-        img_embedding1: (batch_size, num_frames, embed_dim)
-        输出: 投射后的特征向量 (batch_size, similarity_dim)
+        输入：imgs_embedding → (batch, num_frames, 2*embed_dim)（双摄像头连续帧嵌入）
+        输出：image_proj → (batch, similarity_dim)（投射到相似度空间的特征）
         """
-        # 将两个图像嵌入序列拼接
-        imgs_embedding = self.positional_encoding(imgs_embedding)  # 加位置编码
-        # 通过Transformer编码器
-        transformer_out = self.transformer_encoder(imgs_embedding)  # (batch, 2*num_frames, embed_dim)
-
-        # 取最后一个时间步的输出作为特征
-        feature = transformer_out[:, -1, :]  # (batch, embed_dim)
-
-        # 通过全连接层投射到相似度空间
-        return self.fc(feature)  # (batch, similarity_dim)
+        # 加入位置编码
+        imgs_embedding_pe = self.positional_encoding(imgs_embedding)
+        # Transformer编码时序特征
+        transformer_out = self.transformer_encoder(imgs_embedding_pe)  # (batch, num_frames, 2*embed_dim)
+        # 取最后一帧特征作为全局表示
+        final_feat = transformer_out[:, -1, :]  # (batch, 2*embed_dim)
+        # 投射到相似度空间
+        return self.fc(final_feat)
 
 
 class SimilarityModelDriver(nn.Module):
-    """
-    处理单独一帧的driver embedding的投射模型
-    仅使用全连接层
-    """
+    """处理单帧电机动作嵌入的投射模型"""
 
-    def __init__(self, embed_dim=32, similarity_dim=128):
+    def __init__(self, embed_dim=64, similarity_dim=128):
         super(SimilarityModelDriver, self).__init__()
-        # 全连接层，将输出映射到相似度空间
+        # 全连接层（映射到相似度空间）
         self.fc = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.ReLU(),
@@ -303,111 +288,101 @@ class SimilarityModelDriver(nn.Module):
 
     def forward(self, driver_embedding):
         """
-        输入: 单帧的驾驶员嵌入 (batch_size, embed_dim)
-        输出: 投射后的特征向量 (batch_size, similarity_dim)
+        输入：driver_embedding → (batch, embed_dim)（单帧电机动作嵌入）
+        输出：driver_proj → (batch, similarity_dim)（投射到相似度空间的特征）
         """
-        return self.fc(driver_embedding)  # (batch, similarity_dim)
+        return self.fc(driver_embedding)
 
-# 示例使用
+
+def calculate_model_size(model):
+    """计算模型总参数量和缓冲区大小（单位：MB）"""
+    # 参数量大小（字节）
+    param_size = sum(p.numel() * p.element_size() for p in model.parameters())
+    # 缓冲区大小（字节，如位置编码pe）
+    buffer_size = sum(b.numel() * b.element_size() for b in model.buffers())
+    # 转换为MB（1MB = 1024^2 字节）
+    total_size_mb = (param_size + buffer_size) / (1024 ** 2)
+    return total_size_mb
+
+
+# ------------------------------
+# 示例使用（验证修改后模型正确性）
+# ------------------------------
 if __name__ == "__main__":
-    embed_dim = 128
-    nhead = 8
-    num_layers = 16
-    motor_dim = 2
-    seq_length = 30
+    # 1. 配置参数
+    batch_size = 1
+    seq_length = 30  # 观测序列长度
+    motor_dim = 2  # 两个电机（动作维度=2）
+    embed_dim = 128  # 嵌入维度
+    num_candidates = 5  # 生成候选动作数量
 
-    # 初始化模型
-    image_embed = ImageEmbedding(embed_dim, num_layers=3, is_resnet=False)
+    # 2. 初始化模型
+    image_embed = ImageEmbedding(embed_dim=embed_dim, num_layers=3, is_resnet=False)
     motor_embed = MotorEmbedding(motor_dim=motor_dim, embed_dim=embed_dim)
-    generator = EncoderOnlyCandidateGenerator(
+    candidate_generator = EncoderOnlyCandidateGenerator(
         embed_dim=embed_dim,
-        nhead=nhead,
-        num_layers=num_layers,
+        nhead=8,
+        num_layers=16,  # 简化层数便于测试
         motor_dim=motor_dim,
         max_seq_length=seq_length
     )
-
-    # 构造输入
-    batch_size = 1
-    images = torch.randn(batch_size, seq_length, 2, 3, 256, 256)  # (batch, seq, 2相机, 3, H, W)
-    motor_data = torch.randn(batch_size, seq_length, motor_dim)  # (batch, seq, motor_dim)
-
-    # 生成候选动作
-    image_embedded = image_embed(images)  # (batch, seq, 2*embed_dim)
-    motor_embedded = motor_embed(motor_data)  # (batch, seq, embed_dim)
-    for i in range(10):
-        time_start = time.time()
-        outputs = generator(
-            image_embedded=image_embedded,
-            motor_embedded=motor_embedded,
-            num_candidates=5,  # 生成5个候选
-            temperature=0.3  # 低温度：候选更集中；高温度：更发散
-        )
-        print(f"生成时间: {time.time() - time_start:.4f} 秒")
-    # 输出结果形状
-    print(f"生成候选数量：{len(outputs['candidates1'])}")
-    print(f"单个候选形状：{outputs['candidates1'][0].shape}")  # (batch=2, 1, motor_dim=12)
-
-    # 新增：打印模型大小
-    image_size = calculate_model_size(image_embed)
-    motor_size = calculate_model_size(motor_embed)
-    generator_size = calculate_model_size(generator)
-    total_size = image_size + motor_size + generator_size
-
-    print("\n模型大小统计（MB）：")
-    print(f"图像嵌入模块：{image_size:.2f} MB")
-    print(f"电机嵌入模块：{motor_size:.2f} MB")
-    print(f"Transformer模块：{generator_size:.2f} MB")
-    print(f"总模型大小：{total_size:.2f} MB")
-
-
-    # similarity model test
-    # 配置参数
-    batch_size = 1
-    embed_dim = 32
-    num_frames = 15  # 连续帧数
-    similarity_dim = 32  # 投射后的维度
-
-    # 创建模型实例
     img_sim_model = SimilarityModelImage(
         embed_dim=embed_dim,
-        num_frames=num_frames,
-        num_layers=3,
+        num_frames=seq_length,
+        num_layers=2,
         nhead=4,
-        similarity_dim=similarity_dim
+        similarity_dim=32
     )
-
     driver_sim_model = SimilarityModelDriver(
         embed_dim=embed_dim,
-        similarity_dim=similarity_dim
+        similarity_dim=32
     )
 
-    # 创建随机输入数据
-    # 连续帧图像嵌入1: (batch, num_frames, embed_dim)
-    img_emb1 = torch.randn(batch_size, num_frames, embed_dim)
-    # 连续帧图像嵌入2: (batch, num_frames, embed_dim)
-    img_emb2 = torch.randn(batch_size, num_frames, embed_dim)
-    # 驾驶员嵌入: (batch, embed_dim)
-    driver_emb = torch.randn(batch_size, embed_dim)
+    # 3. 构造输入数据
+    # 图像输入：(batch, seq, num_cameras=2, 3, H=64, W=64)
+    images = torch.randn(batch_size, seq_length, 2, 3, 64, 64)
+    # 电机动作输入：(batch, seq, motor_dim=2)
+    motor_data = torch.randn(batch_size, seq_length, motor_dim)
+    # 未来图像输入（用于相似度模型）：(batch, num_frames=seq_length, 2, 3, 64, 64)
+    future_images = torch.randn(batch_size, seq_length, 2, 3, 64, 64)
 
-    # 模型前向传播
-    img_proj = img_sim_model(img_emb1, img_emb2)  # (batch, similarity_dim)
-    driver_proj = driver_sim_model(driver_emb)  # (batch, similarity_dim)
+    # 4. 模型前向传播（验证流程）
+    # 4.1 图像和电机嵌入
+    image_embedded = image_embed(images)  # (batch, seq, 2*embed_dim)
+    motor_embedded = motor_embed(motor_data)  # (batch, seq, embed_dim)
+    future_image_embedded = image_embed(future_images)  # (batch, seq, 2*embed_dim)
 
-    # 计算余弦相似度
-    cos_sim = F.cosine_similarity(img_proj, driver_proj, dim=1)
+    # 4.2 生成候选动作（验证修改后输出）
+    gen_outputs = candidate_generator(
+        image_embedded=image_embedded,
+        motor_embedded=motor_embedded,
+        num_candidates=num_candidates,
+        temperature=0.5
+    )
 
-    # 输出结果信息
-    print(f"图像投射输出形状: {img_proj.shape}")
-    print(f"电机投射输出形状: {driver_proj.shape}")
-    print(f"余弦相似度输出形状: {cos_sim.shape}")
-    print(f"余弦相似度值范围: [{cos_sim.min():.4f}, {cos_sim.max():.4f}]")
+    # 4.3 相似度模型前向（验证维度匹配）
+    img_proj = img_sim_model(future_image_embedded)  # (batch, 32)
+    # 取最后一帧电机嵌入输入相似度模型
+    last_motor_embedded = motor_embedded[:, -1, :]  # (batch, embed_dim)
+    driver_proj = driver_sim_model(last_motor_embedded)  # (batch, 32)
 
-    # 新增：打印模型大小
-    img_sim_model_size = calculate_model_size(img_sim_model)
-    driver_sim_model_size = calculate_model_size(driver_sim_model)
+    # 5. 打印结果（验证修改正确性）
+    print("=" * 60)
+    print("1. 候选生成器输出检查（核心修改验证）")
+    print(f"   - 候选动作数量：{len(gen_outputs['candidates'])}（应等于{num_candidates}）")
+    print(f"   - 单个候选形状：{gen_outputs['candidates'][0].shape}（应是(batch,1,2)）")
+    print(f"   - 动作均值形状：{gen_outputs['mean'].shape}（应是(batch,2)）")
+    print(f"   - 动作标准差形状：{gen_outputs['std'].shape}（应是(batch,2)）")
 
-    print("\n相似度模型大小统计（MB）：")
-    print(f"图像相似度模型：{img_sim_model_size:.2f} MB")
-    print(f"驾驶员相似度模型：{driver_sim_model_size:.2f} MB")
-    print(f"总相似度模型大小：{(img_sim_model_size + driver_sim_model_size):.2f} MB")
+    print("\n2. 相似度模型输出检查")
+    print(f"   - 图像投射特征形状：{img_proj.shape}（应是(batch,32)）")
+    print(f"   - 电机投射特征形状：{driver_proj.shape}（应是(batch,32)）")
+    print(f"   - 余弦相似度：{F.cosine_similarity(img_proj, driver_proj, dim=1).tolist()}")
+
+    print("\n3. 模型大小统计（MB）")
+    print(f"   - 图像嵌入模型：{calculate_model_size(image_embed):.2f} MB")
+    print(f"   - 电机嵌入模型：{calculate_model_size(motor_embed):.2f} MB")
+    print(f"   - 候选生成模型：{calculate_model_size(candidate_generator):.2f} MB")
+    print(f"   - 图像相似度模型：{calculate_model_size(img_sim_model):.2f} MB")
+    print(f"   - 电机相似度模型：{calculate_model_size(driver_sim_model):.2f} MB")
+    print("=" * 60)
