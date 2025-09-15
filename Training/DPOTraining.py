@@ -31,7 +31,7 @@ CONFIG = {
 
     "batch_size": 1,
     "epochs": 30,
-    "lr": 5e-4,
+    "lr": 5e-6,
     "num_candidates": 5,
     "sampling_workers": 2,
     "max_train_samples_per_epoch": 100,
