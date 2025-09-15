@@ -24,7 +24,7 @@ from tqdm import tqdm
 device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 print(f"[初始化] 使用设备: {device}")
 
-# ---------------------- 核心配置参数（新增关键层识别参数） ----------------------
+# ---------------------- 核心配置参数（删除use_candidates，适配单组动作） ----------------------
 CONFIG = {
     # 验证控制
     "max_val_batches": 30,
@@ -42,17 +42,17 @@ CONFIG = {
     "batch_size": 1,
     "epochs": 30,
     "lr": 5e-6,
-    "num_candidates": 5,
+    "num_candidates": 5,  # 单组候选动作数量
     "sampling_workers": 2,
     "max_train_samples_per_epoch": 50,
     "dpo_beta": 0.1,
     "repeat_threshold": 0.95,
     "history_cache_size": 10,
-    "use_candidates": "candidates1",
+    # 【核心删除】移除use_candidates（不再区分candidates1/candidates2）
     "embed_dim_gen": 128,
     "nhead_gen": 8,
     "num_layers_gen": 16,  # Transformer层数
-    "motor_dim": 2,
+    "motor_dim": 2,  # 单组动作含2个电机信号
     "gen_seq_len": 30,
     "sim_seq_len": 30,
     "embed_dim_sim": 128,
@@ -71,16 +71,16 @@ os.makedirs(os.path.dirname(CONFIG["dpo_save_path"]), exist_ok=True)
 os.makedirs(os.path.dirname(CONFIG["dpo_loss_path"]), exist_ok=True)
 
 
-# # ---------------------- Transformer相关模型定义（确保与提供的代码一致） ----------------------
+# # ---------------------- Transformer相关模型定义（适配单组动作参数） ----------------------
 class TransformerEncoderModel(nn.Module):
     def __init__(self, embed_dim=64, nhead=8, num_layers=16):
         super(TransformerEncoderModel, self).__init__()
-        # 存储每一层的编码器
+        # 存储每一层的编码器（输入维度：embed_dim*3，与融合特征匹配）
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(d_model=embed_dim * 3, nhead=nhead, batch_first=True)
             for _ in range(num_layers)
         ])
-        # 为每一层创建训练控制开关，默认都参与训练
+        # 层训练控制开关（默认全部可训练）
         self.layer_trainable = nn.Parameter(torch.ones(num_layers, dtype=torch.bool), requires_grad=False)
 
     def set_layer_trainable(self, layer_idx, trainable):
@@ -94,96 +94,69 @@ class TransformerEncoderModel(nn.Module):
         current = src
 
         for i, layer in enumerate(self.layers):
-            # 根据开关决定是否让该层参与训练
+            # 根据开关控制梯度计算
             if self.layer_trainable[i]:
-                # 该层参与训练，正常计算
                 current = layer(current)
             else:
-                # 该层不参与训练，关闭梯度计算
                 with torch.no_grad():
                     current = layer(current)
-
-            # 保存当前层的输出
             layer_outputs.append(current)
 
-        return layer_outputs  # 返回所有层的输出列表，最后一个元素是最终输出
+        return layer_outputs  # [num_layers, batch, seq, 3*embed_dim]
 
 
 class EncoderOnlyCandidateGenerator(nn.Module):
+    """【核心修改】适配单组动作参数，删除双组输出层"""
     def __init__(self, embed_dim, nhead, num_layers, motor_dim=2, max_seq_length=100):
         super().__init__()
-        self.d_model = embed_dim * 3  # 融合后的特征维度
+        self.d_model = embed_dim * 3  # 融合特征维度（motor_embed + image_embed）
         self.positional_encoding = PositionalEncoding(self.d_model, max_seq_length)
         self.encoder = TransformerEncoderModel(embed_dim, nhead, num_layers)
 
-        # 输出层：为两种数据分别预测分布参数
-        # 第一组数据的分布参数
-        self.fc_mean1 = nn.Linear(self.d_model, motor_dim)  # 第一组均值
-        self.fc_logvar1 = nn.Linear(self.d_model, motor_dim)  # 第一组对数方差
-
-        # 第二组数据的分布参数
-        self.fc_mean2 = nn.Linear(self.d_model, motor_dim)  # 第二组均值
-        self.fc_logvar2 = nn.Linear(self.d_model, motor_dim)  # 第二组对数方差
+        # 【核心修改】仅保留一组输出层（对应2个电机信号）
+        self.fc_mean = nn.Linear(self.d_model, motor_dim)  # 动作均值（batch, 2）
+        self.fc_logvar = nn.Linear(self.d_model, motor_dim)  # 动作对数方差（batch, 2）
 
     def forward(self, image_embedded, motor_embedded, num_candidates=5, temperature=0.5):
         """
-        生成多个1帧动作候选，返回两组数据及其分布参数
-        :param image_embedded: 图像嵌入 (batch, seq, 2*embed_dim)
-        :param motor_embedded: 历史电机嵌入 (batch, seq, embed_dim)
-        :param num_candidates: 候选数量
-        :param temperature: 温度参数（控制采样随机性，>0，越小越集中）
-        :return: 两组候选动作列表及对应的均值和标准差
+        生成单组候选动作，返回分布参数和每一层编码器输出（用于关键层识别）
+        :param image_embedded: (batch, seq, 2*embed_dim)
+        :param motor_embedded: (batch, seq, embed_dim)
+        :return: dict含单组候选、分布参数、层输出
         """
-        # 1. 融合输入特征
+        # 1. 融合图像与电机特征
         combined = torch.cat([motor_embedded, image_embedded], dim=-1)  # (batch, seq, 3*embed_dim)
         combined = self.positional_encoding(combined)  # 加位置编码
 
-        # 2. Encoder提取全局特征
-        encoder_out = self.encoder(combined)  # 得到每一层的输出列表
-        final_out = encoder_out[-1]
-        global_feat = final_out.mean(dim=1)  # 取序列均值作为全局特征 (batch, 3*embed_dim)
+        # 2. Transformer编码器（返回所有层输出）
+        encoder_layer_outputs = self.encoder(combined)  # [num_layers, batch, seq, 3*embed_dim]
+        final_encoder_out = encoder_layer_outputs[-1]  # 最后一层输出
+        global_feat = final_encoder_out.mean(dim=1)  # 序列均值作为全局特征（batch, 3*embed_dim）
 
-        # 3. 预测第一组数据的分布参数（均值+标准差）
-        mean1 = self.fc_mean1(global_feat)  # (batch, motor_dim)
-        logvar1 = self.fc_logvar1(global_feat)  # (batch, motor_dim)
-        logvar1 = torch.clamp(logvar1, min=-5, max=5)
-        std1 = torch.exp(0.5 * logvar1) * temperature  # 温度调整标准差
+        # 3. 预测单组动作分布参数
+        mean = self.fc_mean(global_feat)  # (batch, 2)
+        logvar = self.fc_logvar(global_feat)  # (batch, 2)
+        logvar = torch.clamp(logvar, min=-5, max=5)  # 限制方差范围
+        std = torch.exp(0.5 * logvar) * temperature  # 温度调整标准差
 
-        # 预测第二组数据的分布参数（均值+标准差）
-        mean2 = self.fc_mean2(global_feat)  # (batch, motor_dim)
-        logvar2 = self.fc_logvar2(global_feat)  # (batch, motor_dim)
-        logvar2 = torch.clamp(logvar2, min=-5, max=5)
-        std2 = torch.exp(0.5 * logvar2) * temperature  # 温度调整标准差
-
-        # 4. 从高斯分布中多次采样，生成候选，并使用tanh限制在[-1, 1]
-        candidates1 = []
-        candidates2 = []
+        # 4. 生成单组候选动作
+        candidates = []
         for _ in range(num_candidates):
-            # 第一组采样
-            eps1 = torch.randn_like(mean1)  # 标准正态分布噪声
-            sample1 = mean1 + std1 * eps1  # (batch, motor_dim)
-            sample1 = torch.tanh(sample1)  # 将输出限制在[-1, 1]之间
-            candidates1.append(sample1.unsqueeze(1))  # 增加时间维度 (batch, 1, motor_dim)
+            eps = torch.randn_like(mean)  # 标准正态噪声（batch, 2）
+            sample = mean + std * eps  # 重参数化采样
+            sample = torch.tanh(sample)  # 动作范围限制在[-1,1]
+            candidates.append(sample.unsqueeze(1))  # 增加时间维度（batch, 1, 2）
 
-            # 第二组采样
-            eps2 = torch.randn_like(mean2)  # 标准正态分布噪声
-            sample2 = mean2 + std2 * eps2  # (batch, motor_dim)
-            sample2 = torch.tanh(sample2)  # 将输出限制在[-1, 1]之间
-            candidates2.append(sample2.unsqueeze(1))  # 增加时间维度 (batch, 1, motor_dim)
-
-        # 返回两组候选以及它们的均值和标准差，同时返回所有层的输出用于关键层识别
+        # 【核心修改】返回单组候选和参数，保留层输出用于关键层识别
         return {
-            'candidates1': candidates1,
-            'mean1': mean1,
-            'std1': std1,
-            'candidates2': candidates2,
-            'mean2': mean2,
-            'std2': std2,
-            'encoder_layer_outputs': encoder_out  # 新增：返回每一层的输出
+            'candidates': candidates,  # 单组候选动作列表：[num_candidates, (batch,1,2)]
+            'mean': mean,              # 单组均值：(batch,2)
+            'std': std,                # 单组标准差：(batch,2)
+            'encoder_layer_outputs': encoder_layer_outputs  # 所有层输出：用于关键层识别
         }
 
 
-# ---------------------- 1. 模型加载 ----------------------
+# ---------------------- 1. 模型加载（适配单组动作模型权重） ----------------------
 def load_pretrained_models(pretrained_path):
     image_embed = ImageEmbedding(
         embed_dim=CONFIG["embed_dim_gen"],
@@ -225,7 +198,7 @@ def load_pretrained_models(pretrained_path):
         similarity_dim=CONFIG["similarity_dim"]
     ).to(device)
 
-    # 加载权重
+    # 加载单组动作模型权重（键为mean/std，无mean1/mean2）
     try:
         checkpoint = torch.load(pretrained_path, map_location=device)
         image_embed.load_state_dict(checkpoint["model_states"]["image_embed"])
@@ -238,7 +211,7 @@ def load_pretrained_models(pretrained_path):
     except Exception as e:
         raise RuntimeError(f"[模型加载失败] {str(e)}") from e
 
-    # 冻结非策略模型
+    # 冻结非策略模型（仅policy_generator可训练）
     for model in [image_embed, motor_embed, ref_generator, img_sim_model, driver_sim_model]:
         for param in model.parameters():
             param.requires_grad = False
@@ -247,7 +220,7 @@ def load_pretrained_models(pretrained_path):
     return image_embed, motor_embed, policy_generator, ref_generator, img_sim_model, driver_sim_model
 
 
-# ---------------------- 2. 数据加载 ----------------------
+# ---------------------- 2. 数据加载（无需修改） ----------------------
 def load_dataset():
     data_root = CONFIG["data_root_dirs"]
     if not os.path.exists(data_root):
@@ -271,7 +244,7 @@ def load_dataset():
     except Exception as e:
         raise RuntimeError(f"[数据集加载失败] {str(e)}") from e
 
-    # 检查batch_size
+    # 检查batch_size一致性
     def check_batch_size(dataloader, name, expected_size):
         for batch in dataloader:
             imgs1 = batch[0]
@@ -303,21 +276,15 @@ def load_dataset():
     return train_loader, val_loader
 
 
-# ---------------------- 3. 核心工具函数（新增关键层识别相关函数） ----------------------
+# ---------------------- 3. 核心工具函数（适配单组动作，保留关键层逻辑） ----------------------
 def calculate_layer_similarity(layer_outputs):
-    """
-    计算每一层输出与其他层输出的余弦相似度
-    :param layer_outputs: 每一层的输出列表，形状为 [num_layers, batch, seq, dim]
-    :return: 相似度矩阵 [num_layers, num_layers]
-    """
+    """计算层间余弦相似度（关键层识别核心，逻辑不变）"""
     num_layers = len(layer_outputs)
     similarity_matrix = torch.zeros(num_layers, num_layers, device=device)
 
-    # 对每一层计算与其他层的相似度
     for i in range(num_layers):
-        # 展平特征维度：[batch, seq, dim] -> [batch, seq*dim]
+        # 展平特征：[batch, seq, dim] → [batch, seq*dim]
         output_i = layer_outputs[i].view(layer_outputs[i].shape[0], -1)
-        # 标准化
         output_i_norm = F.normalize(output_i, dim=1)
 
         for j in range(num_layers):
@@ -328,7 +295,7 @@ def calculate_layer_similarity(layer_outputs):
             output_j = layer_outputs[j].view(layer_outputs[j].shape[0], -1)
             output_j_norm = F.normalize(output_j, dim=1)
 
-            # 计算批次平均余弦相似度
+            # 批次平均相似度
             sim = F.cosine_similarity(output_i_norm, output_j_norm, dim=1).mean()
             similarity_matrix[i, j] = sim
 
@@ -336,29 +303,22 @@ def calculate_layer_similarity(layer_outputs):
 
 
 def identify_key_layers(policy_generator, sample_batch, image_embed, motor_embed):
-    """
-    识别Transformer编码器中的关键层
-    :param policy_generator: EncoderOnlyCandidateGenerator模型
-    :param sample_batch: 用于分析的样本批次
-    :param image_embed: 图像嵌入模型
-    :param motor_embed: 电机嵌入模型
-    :return: 关键层索引列表
-    """
-    # 解包样本批次
+    """识别关键层（逻辑不变，适配单组动作模型输出）"""
+    # 解包样本
     imgs1, imgs2, driver, _, _, _ = sample_batch
     images = torch.stack([imgs1, imgs2], dim=2).to(device)
     driver = driver.to(device)
 
-    # 获取嵌入特征
+    # 特征嵌入（无梯度）
     with torch.no_grad():
         image_embedded = image_embed(images)
         motor_embedded = motor_embed(driver)
 
-    # 获取模型输出，包括每一层的编码器输出
+    # 【适配修改】获取单组动作模型输出（含层输出）
     model_output = policy_generator(
         image_embedded=image_embedded,
         motor_embedded=motor_embedded,
-        num_candidates=1  # 只需要1个候选即可用于分析
+        num_candidates=1  # 仅需1个候选用于层分析
     )
     layer_outputs = model_output["encoder_layer_outputs"]
     num_layers = len(layer_outputs)
@@ -367,67 +327,48 @@ def identify_key_layers(policy_generator, sample_batch, image_embed, motor_embed
     # 计算层间相似度矩阵
     similarity_matrix = calculate_layer_similarity(layer_outputs)
 
-    # 初始化关键层集合
-    key_layers = set()
-
-    # 最后一层直接设为关键层
-    key_layers.add(num_layers - 1)
-
     # 识别关键层
+    key_layers = set()
+    key_layers.add(num_layers - 1)  # 最后一层默认是关键层
+
     for i in range(num_layers):
-        # 对于倒数P层，特殊处理：与所有后续层比较
         if i >= num_layers - P:
-            # 后续层是i+1到最后一层
+            # 倒数P层：与后续所有层比较
             next_layers = range(i + 1, num_layers)
-            if not next_layers:  # 最后一层已经处理过
+            if not next_layers:
                 continue
-
-            # 计算与后续层的平均相似度
             avg_sim = torch.mean(similarity_matrix[i, list(next_layers)]).item()
-
             if avg_sim >= CONFIG["similarity_threshold"]:
                 key_layers.add(i)
         else:
-            # 对于其他层，与后面P层比较
+            # 其他层：与后续P层比较
             next_layers = range(i + 1, min(i + 1 + P, num_layers))
             if not next_layers:
                 continue
-
-            # 计算与后面P层的平均相似度
             avg_sim = torch.mean(similarity_matrix[i, list(next_layers)]).item()
-
             if avg_sim >= CONFIG["similarity_threshold"]:
                 key_layers.add(i)
 
-    # 转换为排序后的列表
     key_layers_list = sorted(list(key_layers))
     print(f"[关键层识别] 共识别到 {len(key_layers_list)} 个关键层: {key_layers_list}")
     return key_layers_list
 
 
 def select_layers_for_training(policy_generator, key_layers):
-    """
-    从关键层中随机选择Q个层进行训练，其他层不训练
-    :param policy_generator: EncoderOnlyCandidateGenerator模型
-    :param key_layers: 关键层索引列表
-    :return: 被选中进行训练的层索引
-    """
+    """从关键层选Q个训练（逻辑不变）"""
     num_layers = len(policy_generator.encoder.layers)
     Q = CONFIG["Q"]
 
-    # 确保关键层数量不小于Q，若小于则全部选中
+    # 选Q个关键层（不足则全选）
     if len(key_layers) <= Q:
         selected_layers = key_layers
     else:
-        # 随机选择Q个关键层
         selected_indices = np.random.choice(len(key_layers), Q, replace=False)
         selected_layers = [key_layers[i] for i in selected_indices]
 
-    # 先将所有层设置为不可训练
+    # 先冻结所有层，再激活选中层
     for i in range(num_layers):
         policy_generator.encoder.set_layer_trainable(i, False)
-
-    # 再将选中的层设置为可训练
     for layer_idx in selected_layers:
         policy_generator.encoder.set_layer_trainable(layer_idx, True)
 
@@ -437,8 +378,9 @@ def select_layers_for_training(policy_generator, key_layers):
 
 
 def gaussian_log_prob(mean: torch.Tensor, std: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    """计算高斯对数概率（适配单组mean/std）"""
     eps = 1e-6
-    std = std + eps
+    std = std + eps  # 避免log(0)
     log_prob = -0.5 * torch.log(2 * torch.tensor(np.pi, device=device)) - torch.log(std) - (action - mean) ** 2 / (
                 2 * std ** 2)
     return log_prob.sum(dim=-1)
@@ -447,21 +389,19 @@ def gaussian_log_prob(mean: torch.Tensor, std: torch.Tensor, action: torch.Tenso
 def get_generator_distribution(generator: EncoderOnlyCandidateGenerator,
                                image_embedded: torch.Tensor,
                                motor_embedded: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    combined = torch.cat([motor_embedded, image_embedded], dim=-1)
+    """【核心修改】获取单组动作分布参数（删除双组分支）"""
+    combined = torch.cat([motor_embedded, image_embedded], dim=-1)  # (batch, seq, 3*embed_dim)
     combined = generator.positional_encoding(combined)
-    encoder_out = generator.encoder(combined)
-    encoder_out = encoder_out[-1]
-    global_feat = encoder_out.mean(dim=1)
+    encoder_out = generator.encoder(combined)  # 层输出列表
+    final_encoder_out = encoder_out[-1]  # 最后一层输出
+    global_feat = final_encoder_out.mean(dim=1)  # (batch, 3*embed_dim)
 
-    if CONFIG["use_candidates"] == "candidates1":
-        mean = generator.fc_mean1(global_feat)
-        logvar = generator.fc_logvar1(global_feat)
-    else:
-        mean = generator.fc_mean2(global_feat)
-        logvar = generator.fc_logvar2(global_feat)
-
+    # 【核心修改】仅获取单组mean/std
+    mean = generator.fc_mean(global_feat)  # (batch, 2)
+    logvar = generator.fc_logvar(global_feat)  # (batch, 2)
     logvar = torch.clamp(logvar, min=-5, max=5)
-    std = torch.exp(0.5 * logvar)
+    std = torch.exp(0.5 * logvar)  # (batch, 2)
+
     return mean, std
 
 
@@ -470,63 +410,62 @@ def select_preferred_rejected(candidates: list[torch.Tensor],
                               future_driver_last: torch.Tensor,
                               motor_embed: MotorEmbedding,
                               batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """选择偏好和非偏好动作，返回sim_total用于后续分析"""
-    # 1. 维度检查
+    """选择偏好/非偏好动作（适配单组候选，逻辑不变）"""
+    # 维度检查（单组候选）
     assert len(candidates) == CONFIG["num_candidates"], f"候选数={len(candidates)}，需为{CONFIG['num_candidates']}"
     for i, cand in enumerate(candidates):
-        assert cand.shape == (batch_size, CONFIG["motor_dim"]), \
-            f"候选{i}维度错误：{cand.shape}，需为({batch_size},{CONFIG['motor_dim']})"
+        assert cand.shape == (batch_size, 1, CONFIG["motor_dim"]), \
+            f"候选{i}维度错误：{cand.shape}，需为({batch_size},1,{CONFIG['motor_dim']})"
     assert future_driver_last.shape == (batch_size, CONFIG["motor_dim"]), \
         f"future_driver_last维度错误：{future_driver_last.shape}"
 
-    # 2. 候选动作嵌入
+    # 候选动作嵌入
     candidate_embeddings = []
     for cand in candidates:
-        cand_with_seq = cand.unsqueeze(1)  # (B,1,2)
-        emb = motor_embed(cand_with_seq)  # (B,1,128)
+        emb = motor_embed(cand)  # (batch, 1, embed_dim_gen)
         candidate_embeddings.append(emb)
 
-    # 3. 计算图像相似度
+    # 图像相似度计算
     sim_img = []
     for emb in candidate_embeddings:
-        cand_proj = driver_sim_model(emb).squeeze(1)  # (B,32)
-        img_proj_future_squeezed = img_proj_future.squeeze(1)  # (B,32)
-        sim = F.cosine_similarity(cand_proj, img_proj_future_squeezed, dim=1)  # (B,)
+        cand_proj = driver_sim_model(emb).squeeze(1)  # (batch, similarity_dim)
+        img_proj_squeezed = img_proj_future.squeeze(1)  # (batch, similarity_dim)
+        sim = F.cosine_similarity(cand_proj, img_proj_squeezed, dim=1)  # (batch,)
         sim_img.append(sim)
 
-    # 4. 计算动作相似度
-    future_driver_with_seq = future_driver_last.unsqueeze(1)  # (B,1,2)
-    future_driver_emb = motor_embed(future_driver_with_seq)  # (B,1,128)
-    future_emb_squeezed = future_driver_emb.squeeze(1)  # (B,128)
-    future_norm = F.normalize(future_emb_squeezed, dim=1)  # (B,128)
+    # 动作相似度计算
+    future_driver_seq = future_driver_last.unsqueeze(1)  # (batch, 1, 2)
+    future_driver_emb = motor_embed(future_driver_seq)  # (batch, 1, embed_dim_gen)
+    future_emb_squeezed = future_driver_emb.squeeze(1)  # (batch, embed_dim_gen)
+    future_norm = F.normalize(future_emb_squeezed, dim=1)  # (batch, embed_dim_gen)
 
     sim_driver = []
     for emb in candidate_embeddings:
-        emb_squeezed = emb.squeeze(1)  # (B,128)
-        emb_norm = F.normalize(emb_squeezed, dim=1)  # (B,128)
-        sim = F.cosine_similarity(emb_norm, future_norm, dim=1)  # (B,)
+        emb_squeezed = emb.squeeze(1)  # (batch, embed_dim_gen)
+        emb_norm = F.normalize(emb_squeezed, dim=1)  # (batch, embed_dim_gen)
+        sim = F.cosine_similarity(emb_norm, future_norm, dim=1)  # (batch,)
         sim_driver.append(sim)
 
-    # 5. 计算总相似度
+    # 总相似度（加权融合）
     alpha = CONFIG["alpha"]
-    sim_img_tensor = torch.stack(sim_img).T  # (B, 5)
-    sim_driver_tensor = torch.stack(sim_driver).T  # (B, 5)
-    sim_total = alpha * sim_img_tensor + (1 - alpha) * sim_driver_tensor  # (B, 5)
+    sim_img_tensor = torch.stack(sim_img).T  # (batch, num_candidates)
+    sim_driver_tensor = torch.stack(sim_driver).T  # (batch, num_candidates)
+    sim_total = alpha * sim_img_tensor + (1 - alpha) * sim_driver_tensor  # (batch, num_candidates)
 
-    # 6. 选择偏好/非偏好动作
-    preferred_idx = sim_total.argmax(dim=1)  # (B,)
-    rejected_idx = sim_total.argmin(dim=1)  # (B,)
+    # 选择偏好/非偏好动作
+    preferred_idx = sim_total.argmax(dim=1)  # (batch,)
+    rejected_idx = sim_total.argmin(dim=1)  # (batch,)
 
-    # 7. 提取动作
-    candidates_tensor = torch.stack(candidates).permute(1, 0, 2)  # (B,5,2)
+    # 提取动作
+    candidates_tensor = torch.stack(candidates).permute(1, 0, 2, 3)  # (batch, num_candidates, 1, 2)
     preferred = torch.gather(
         candidates_tensor, 1,
-        preferred_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, CONFIG["motor_dim"])
-    ).squeeze(1)  # (B,2)
+        preferred_idx.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, -1, 1, CONFIG["motor_dim"])
+    ).squeeze(1).squeeze(1)  # (batch, 2)
     rejected = torch.gather(
         candidates_tensor, 1,
-        rejected_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, CONFIG["motor_dim"])
-    ).squeeze(1)  # (B,2)
+        rejected_idx.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, -1, 1, CONFIG["motor_dim"])
+    ).squeeze(1).squeeze(1)  # (batch, 2)
 
     return preferred, rejected, sim_total
 
@@ -536,36 +475,36 @@ def get_model_highest_prob_action(candidates: list[torch.Tensor],
                                   image_embedded: torch.Tensor,
                                   motor_embedded: torch.Tensor,
                                   policy_gen: EncoderOnlyCandidateGenerator) -> torch.Tensor:
-    """获取模型最高概率的动作"""
+    """获取模型最高概率动作（适配单组分布参数）"""
     batch_size = image_embedded.shape[0]
     num_candidates = len(candidates)
 
-    # 获取模型的分布参数
-    mean, std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)  # (B,2), (B,2)
+    # 获取单组分布参数
+    mean, std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)  # (batch,2), (batch,2)
 
-    # 计算每个候选动作的概率
+    # 计算每个候选的概率
     candidate_probs = []
     for cand in candidates:
-        log_prob = gaussian_log_prob(mean, std, cand)
+        cand_squeezed = cand.squeeze(1)  # (batch, 2)
+        log_prob = gaussian_log_prob(mean, std, cand_squeezed)  # (batch,)
         candidate_probs.append(log_prob)
 
-    # 转换为概率分布
-    probs_tensor = torch.stack(candidate_probs).T  # (B,5)
-    probs_tensor = F.softmax(probs_tensor, dim=1)  # 归一化
-
-    # 找到最高概率的候选索引
-    highest_prob_idx = probs_tensor.argmax(dim=1)  # (B,)
+    # 概率分布归一化
+    probs_tensor = torch.stack(candidate_probs).T  # (batch, num_candidates)
+    probs_tensor = F.softmax(probs_tensor, dim=1)  # (batch, num_candidates)
 
     # 提取最高概率动作
+    highest_prob_idx = probs_tensor.argmax(dim=1)  # (batch,)
     highest_prob_action = torch.gather(
         candidates_tensor, 1,
         highest_prob_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, CONFIG["motor_dim"])
-    ).squeeze(1)  # (B,2)
+    ).squeeze(1)  # (batch, 2)
 
     return highest_prob_action, probs_tensor
 
 
 def is_action_repeated(current_action: torch.Tensor, history_actions: list[torch.Tensor]) -> bool:
+    """动作重复检查（逻辑不变）"""
     assert current_action.shape == (CONFIG["motor_dim"],), f"current_action维度错误：{current_action.shape}"
     if not history_actions:
         return False
@@ -585,24 +524,28 @@ def standard_dpo_loss(policy_gen: EncoderOnlyCandidateGenerator,
                       motor_embedded: torch.Tensor,
                       preferred: torch.Tensor,
                       rejected: torch.Tensor) -> torch.Tensor:
+    """DPO损失计算（适配单组动作参数）"""
     batch_size = preferred.shape[0]
     assert preferred.shape == (batch_size, CONFIG["motor_dim"]), f"preferred维度错误：{preferred.shape}"
     assert rejected.shape == (batch_size, CONFIG["motor_dim"]), f"rejected维度错误：{rejected.shape}"
 
+    # 策略模型概率（单组参数）
     policy_mean, policy_std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)
-    log_p_theta_pref = gaussian_log_prob(policy_mean, policy_std, preferred)  # (B,)
-    log_p_theta_rej = gaussian_log_prob(policy_mean, policy_std, rejected)  # (B,)
+    log_p_theta_pref = gaussian_log_prob(policy_mean, policy_std, preferred)  # (batch,)
+    log_p_theta_rej = gaussian_log_prob(policy_mean, policy_std, rejected)  # (batch,)
 
+    # 参考模型概率（单组参数，无梯度）
     with torch.no_grad():
         ref_mean, ref_std = get_generator_distribution(ref_gen, image_embedded, motor_embedded)
         log_p_ref_pref = gaussian_log_prob(ref_mean, ref_std, preferred)
         log_p_ref_rej = gaussian_log_prob(ref_mean, ref_std, rejected)
 
-    advantage = (log_p_theta_pref - log_p_ref_pref) - (log_p_theta_rej - log_p_ref_rej)  # (B,)
+    # 计算DPO优势与损失
+    advantage = (log_p_theta_pref - log_p_ref_pref) - (log_p_theta_rej - log_p_ref_rej)  # (batch,)
     return -F.logsigmoid(CONFIG["dpo_beta"] * advantage).mean()
 
 
-# ---------------------- 4. 训练/验证函数 ----------------------
+# ---------------------- 4. 训练/验证函数（适配单组候选动作） ----------------------
 def train_one_epoch(epoch: int,
                     train_loader: DataLoader,
                     policy_gen: EncoderOnlyCandidateGenerator,
@@ -610,12 +553,14 @@ def train_one_epoch(epoch: int,
                     optimizer: torch.optim.Optimizer,
                     motor_embed: MotorEmbedding,
                     selected_layers: list) -> tuple[float, int]:
+    """训练单epoch（适配单组候选动作）"""
     policy_gen.train()
     total_loss = 0.0
     optimized_count = 0
     history_actions = []
     batch_size = CONFIG["batch_size"]
 
+    # 进度条显示训练层信息
     pbar = tqdm(enumerate(train_loader),
                 desc=f"[训练] Epoch {epoch + 1}/{CONFIG['epochs']} (训练层: {selected_layers})",
                 total=min(CONFIG["max_train_samples_per_epoch"], len(train_loader)))
@@ -625,6 +570,7 @@ def train_one_epoch(epoch: int,
             print(f"\n[训练] 已达样本上限（{CONFIG['max_train_samples_per_epoch']}），终止")
             break
 
+        # 解包数据
         imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
         assert imgs1.shape[0] == batch_size, f"训练集batch_size错误：{imgs1.shape[0]}"
 
@@ -632,36 +578,40 @@ def train_one_epoch(epoch: int,
         future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(device)
         driver = driver.to(device)
         future_driver = future_driver.to(device)
-        future_driver_last = future_driver[:, -1, :]
+        future_driver_last = future_driver[:, -1, :]  # (batch, 2)
 
+        # 冻结特征提取模块梯度
         with torch.no_grad():
             image_embedded = image_embed(images)
             motor_embedded = motor_embed(driver)
             future_image_embedded = image_embed(future_images)
-            img_proj_future = img_sim_model(future_image_embedded)
+            img_proj_future = img_sim_model(future_image_embedded)  # (batch, 1, similarity_dim)
 
+        # 【核心修改】获取单组候选动作
         generator_output = policy_gen(
             image_embedded=image_embedded,
             motor_embedded=motor_embedded,
             num_candidates=CONFIG["num_candidates"],
             temperature=1.0
         )
-        candidates = generator_output[CONFIG["use_candidates"]]
-        candidates = [cand.squeeze(1) for cand in candidates]
+        candidates = generator_output["candidates"]  # 单组候选列表：[num_candidates, (batch,1,2)]
 
+        # 选择偏好/非偏好动作
         preferred, rejected, _ = select_preferred_rejected(
             candidates=candidates,
             img_proj_future=img_proj_future,
             future_driver_last=future_driver_last,
             motor_embed=motor_embed,
             batch_size=batch_size
-        )
+        )  # (batch,2), (batch,2)
 
-        current_action = preferred.squeeze(0)
+        # 跳过重复动作
+        current_action = preferred.squeeze(0)  # (2,)
         if is_action_repeated(current_action, history_actions):
             pbar.set_postfix({"状态": "跳过重复动作", "优化样本数": optimized_count})
             continue
 
+        # DPO损失计算与优化
         optimizer.zero_grad()
         loss = standard_dpo_loss(
             policy_gen=policy_gen,
@@ -674,10 +624,12 @@ def train_one_epoch(epoch: int,
         loss.backward()
         optimizer.step()
 
+        # 更新历史动作缓存
         history_actions.append(current_action.detach())
         if len(history_actions) > CONFIG["history_cache_size"]:
             history_actions.pop(0)
 
+        # 累计损失与计数
         total_loss += loss.item()
         optimized_count += 1
         pbar.set_postfix({
@@ -695,10 +647,11 @@ def validate_full(epoch: int,
                   policy_gen: EncoderOnlyCandidateGenerator,
                   ref_gen: EncoderOnlyCandidateGenerator,
                   motor_embed: MotorEmbedding) -> tuple[float, int, int]:
+    """验证函数（适配单组候选动作）"""
     policy_gen.eval()
     total_loss = 0.0
     sample_count = 0
-    match_count = 0  # 记录匹配次数
+    match_count = 0  # 偏好动作与最高概率动作匹配次数
     max_batches = CONFIG["max_val_batches"]
     batch_size = CONFIG["val_batch_size"]
     tolerance = CONFIG["action_match_tolerance"]
@@ -714,52 +667,52 @@ def validate_full(epoch: int,
                 print(f"\n[验证] 已达最大batch数（{max_batches}），终止验证")
                 break
 
+            # 解包数据
             imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
             assert imgs1.shape[0] == batch_size, f"验证集batch_size错误：{imgs1.shape[0]}"
 
-            # 数据预处理
             images = torch.stack([imgs1, imgs2], dim=2).to(device)
             future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(device)
             driver = driver.to(device)
             future_driver = future_driver.to(device)
-            future_driver_last = future_driver[:, -1, :]
+            future_driver_last = future_driver[:, -1, :]  # (batch, 2)
 
             # 特征嵌入
             image_embedded = image_embed(images)
             motor_embedded = motor_embed(driver)
             future_image_embedded = image_embed(future_images)
-            img_proj_future = img_sim_model(future_image_embedded)
+            img_proj_future = img_sim_model(future_image_embedded)  # (batch, 1, similarity_dim)
 
-            # 生成候选动作
+            # 【核心修改】获取单组候选动作
             generator_output = policy_gen(
                 image_embedded=image_embedded,
                 motor_embedded=motor_embedded,
                 num_candidates=CONFIG["num_candidates"],
                 temperature=1.0
             )
-            candidates = generator_output[CONFIG["use_candidates"]]
-            candidates = [cand.squeeze(1) for cand in candidates]  # [5, (B,2)]
-            candidates_tensor = torch.stack(candidates).permute(1, 0, 2)  # (B,5,2)
+            candidates = generator_output["candidates"]  # 单组候选列表
+            candidates_squeezed = [cand.squeeze(1) for cand in candidates]  # [num_candidates, (batch,2)]
+            candidates_tensor = torch.stack(candidates_squeezed).permute(1, 0, 2)  # (batch, num_candidates, 2)
 
-            # 1. 选择preferred action
+            # 1. 选择偏好动作
             preferred, rejected, _ = select_preferred_rejected(
                 candidates=candidates,
                 img_proj_future=img_proj_future,
                 future_driver_last=future_driver_last,
                 motor_embed=motor_embed,
                 batch_size=batch_size
-            )  # (B,2)
+            )  # (batch,2)
 
-            # 2. 获取模型最高概率action
+            # 2. 获取模型最高概率动作
             highest_prob_action, _ = get_model_highest_prob_action(
-                candidates=candidates,
+                candidates=candidates_squeezed,
                 candidates_tensor=candidates_tensor,
                 image_embedded=image_embedded,
                 motor_embedded=motor_embedded,
                 policy_gen=policy_gen
-            )  # (B,2)
+            )  # (batch,2)
 
-            # 3. 比较两个动作是否匹配
+            # 3. 统计匹配次数（逐样本）
             for i in range(batch_size):
                 if torch.allclose(
                         preferred[i],
@@ -769,7 +722,7 @@ def validate_full(epoch: int,
                 ):
                     match_count += 1
 
-            # 计算损失
+            # 4. 计算DPO损失
             loss = standard_dpo_loss(
                 policy_gen=policy_gen,
                 ref_gen=ref_gen,
@@ -781,7 +734,7 @@ def validate_full(epoch: int,
             total_loss += loss.item()
             sample_count += batch_size
 
-            # 计算当前批次的匹配率
+            # 进度条更新
             batch_match_rate = (match_count - (sample_count - batch_size)) / batch_size
             pbar.set_postfix({
                 "验证损失": f"{loss.item():.4f}",
@@ -789,6 +742,7 @@ def validate_full(epoch: int,
                 "批次匹配率": f"{batch_match_rate:.2%}"
             })
 
+    # 计算验证指标
     avg_loss = total_loss / (sample_count / batch_size) if sample_count > 0 else 0.0
     match_rate = match_count / sample_count if sample_count > 0 else 0.0
     print(f"[验证] Epoch {epoch + 1} | 平均损失：{avg_loss:.4f} | 总样本数：{sample_count}")
@@ -796,7 +750,7 @@ def validate_full(epoch: int,
     return avg_loss, sample_count, match_count
 
 
-# ---------------------- 5. 主函数（新增关键层识别和训练层选择逻辑） ----------------------
+# ---------------------- 5. 主函数（逻辑不变，适配修改后的子函数） ----------------------
 def main():
     start_total_time = time.time()
     print("\n" + "=" * 60)
@@ -816,7 +770,7 @@ def main():
         print(f"[初始化失败] {str(e)}")
         return
 
-    # 优化器配置（只优化policy_generator的参数）
+    # 优化器配置（仅优化policy_generator）
     optimizer = torch.optim.Adam(
         params=policy_generator.parameters(),
         lr=CONFIG["lr"],
@@ -828,7 +782,7 @@ def main():
         gamma=0.5
     )
 
-    # 损失记录（新增关键层相关记录）
+    # 损失记录（含关键层历史）
     loss_records = {
         "train_loss": [],
         "val_loss": [],
@@ -837,12 +791,12 @@ def main():
         "val_prefer_matches_model": [],
         "val_match_rate": [],
         "key_layers": [],  # 记录每个epoch的关键层
-        "selected_layers": [],  # 记录每个epoch选中训练的层
+        "selected_layers": [],  # 记录每个epoch选中的训练层
         "lr": []
     }
     best_val_loss = float("inf")
 
-    # 训练循环
+    # 训练循环（含关键层识别）
     for epoch in range(CONFIG["epochs"]):
         print("\n" + "-" * 50)
         epoch_start_time = time.time()
@@ -851,7 +805,7 @@ def main():
         # 获取一个样本批次用于关键层识别
         sample_batch = next(iter(train_loader))
 
-        # 1. 识别关键层
+        # 1. 识别关键层（适配单组动作模型）
         key_layers = identify_key_layers(
             policy_generator,
             sample_batch,
@@ -859,13 +813,13 @@ def main():
             motor_embed
         )
 
-        # 2. 从关键层中随机选择Q个层进行训练
+        # 2. 从关键层选Q个训练
         selected_layers = select_layers_for_training(
             policy_generator,
             key_layers
         )
 
-        # 3. 训练（传入选中的层信息用于日志）
+        # 3. 训练（传入选中图层信息）
         train_loss, optimized_samples = train_one_epoch(
             epoch=epoch,
             train_loader=train_loader,
@@ -877,10 +831,9 @@ def main():
         )
 
         # 学习率调度
-        # scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
 
-        # 4. 验证
+        # 4. 验证（适配单组动作）
         val_loss, val_samples, val_matches = validate_full(
             epoch=epoch,
             val_loader=val_loader,
@@ -890,18 +843,18 @@ def main():
         )
         val_match_rate = val_matches / val_samples if val_samples > 0 else 0.0
 
-        # 5. 记录（新增关键层相关记录）
+        # 5. 记录指标（含关键层信息）
         loss_records["train_loss"].append(train_loss)
         loss_records["val_loss"].append(val_loss)
         loss_records["train_optimized_samples"].append(optimized_samples)
         loss_records["val_total_samples"].append(val_samples)
         loss_records["val_prefer_matches_model"].append(val_matches)
         loss_records["val_match_rate"].append(val_match_rate)
-        loss_records["key_layers"].append(key_layers)  # 记录关键层
-        loss_records["selected_layers"].append(selected_layers)  # 记录选中的训练层
+        loss_records["key_layers"].append(key_layers)
+        loss_records["selected_layers"].append(selected_layers)
         loss_records["lr"].append(current_lr)
 
-        # 打印总结
+        # 打印Epoch总结
         epoch_time = time.time() - epoch_start_time
         print(f"\n[Epoch 总结] Epoch {epoch + 1}/{CONFIG['epochs']}")
         print(f"  - 耗时：{epoch_time:.2f}秒 | 学习率：{current_lr:.7f}")
@@ -925,7 +878,7 @@ def main():
             }, CONFIG["dpo_save_path"])
             print(f"  - ✅ 保存最佳模型至：{CONFIG['dpo_save_path']}")
 
-    # 训练完成，保存关键层历史记录
+    # 训练完成：保存关键层历史记录
     np.save(CONFIG["key_layers_record_path"], loss_records)
     total_time = time.time() - start_total_time
 
