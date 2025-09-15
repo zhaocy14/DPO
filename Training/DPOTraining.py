@@ -34,7 +34,7 @@ CONFIG = {
     "lr": 5e-6,
     "num_candidates": 5,
     "sampling_workers": 2,
-    "max_train_samples_per_epoch": 100,
+    "max_train_samples_per_epoch": 50,
     "dpo_beta": 0.1,
     "repeat_threshold": 0.95,
     "history_cache_size": 10,

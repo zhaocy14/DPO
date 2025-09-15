@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 
 # 设备初始化
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 print(f"[初始化] 使用设备: {device}")
 
 # ---------------------- 核心配置参数（新增关键层识别参数） ----------------------
@@ -44,7 +44,7 @@ CONFIG = {
     "lr": 5e-6,
     "num_candidates": 5,
     "sampling_workers": 2,
-    "max_train_samples_per_epoch": 100,
+    "max_train_samples_per_epoch": 50,
     "dpo_beta": 0.1,
     "repeat_threshold": 0.95,
     "history_cache_size": 10,
