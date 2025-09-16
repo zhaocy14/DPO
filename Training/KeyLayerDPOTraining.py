@@ -47,7 +47,7 @@ CONFIG = {
     "max_train_samples_per_epoch": 100,
     "dpo_beta": 0.1,
     "repeat_threshold": 0.97,
-    "history_cache_size": 1,
+    "history_cache_size": 0,
     # 【核心删除】移除use_candidates（不再区分candidates1/candidates2）
     "embed_dim_gen": 128,
     "nhead_gen": 8,
@@ -265,7 +265,7 @@ def load_dataset():
         batch_size=CONFIG["val_batch_size"],
         shuffle=False,
         num_workers=CONFIG["sampling_workers"],
-        pin_memory=True,
+        pin_memory=False,
         drop_last=False
     )
 
