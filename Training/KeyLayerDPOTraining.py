@@ -44,7 +44,7 @@ CONFIG = {
     "lr": 5e-4,
     "num_candidates": 5,  # 单组候选动作数量
     "sampling_workers": 2,
-    "max_train_samples_per_epoch": 100,
+    "max_train_samples_per_epoch": 5000,
     "dpo_beta": 0.1,
     "repeat_threshold": 0.97,
     "history_cache_size": 2,
