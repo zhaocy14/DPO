@@ -26,7 +26,7 @@ CONFIG = {
     "val_batch_size": 6,
 
     # 相似度加权系数
-    "alpha": 0.9,
+    "alpha": 0,
     "action_match_tolerance": 1e-4,  # 动作匹配的容差（处理浮点数精度）
 
     "batch_size": 1,
