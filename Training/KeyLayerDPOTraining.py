@@ -37,7 +37,7 @@ CONFIG = {
     # 关键层识别参数
     "P": 3,  # 倒数P层特殊处理
     "Q": 5,  # 每次训练随机选择Q个关键层更新
-    "similarity_threshold": 0.9,  # 80%相似度阈值
+    "similarity_threshold": 0.85,  # 80%相似度阈值
 
     "batch_size": 1,
     "epochs": 20,
