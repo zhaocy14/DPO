@@ -167,7 +167,7 @@ def load_dataset():
     val_loader = DataLoader(
         dataset=val_dataset,
         batch_size=CONFIG["val_batch_size"],
-        shuffle=False,
+        shuffle=True,
         num_workers=CONFIG["sampling_workers"],
         pin_memory=True,
         drop_last=False
