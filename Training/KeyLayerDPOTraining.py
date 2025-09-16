@@ -47,7 +47,7 @@ CONFIG = {
     "max_train_samples_per_epoch": 100,
     "dpo_beta": 0.1,
     "repeat_threshold": 0.97,
-    "history_cache_size": 0,
+    "history_cache_size": 2,
     # 【核心删除】移除use_candidates（不再区分candidates1/candidates2）
     "embed_dim_gen": 128,
     "nhead_gen": 8,
