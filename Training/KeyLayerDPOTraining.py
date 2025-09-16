@@ -27,8 +27,8 @@ print(f"[初始化] 使用设备: {device}")
 # ---------------------- 核心配置参数（删除use_candidates，适配单组动作） ----------------------
 CONFIG = {
     # 验证控制
-    "max_val_batches": 30,
-    "val_batch_size": 16,
+    "max_val_batches": 20,
+    "val_batch_size": 6,
 
     # 相似度加权系数
     "alpha": 0.9,
@@ -40,14 +40,14 @@ CONFIG = {
     "similarity_threshold": 0.8,  # 80%相似度阈值
 
     "batch_size": 1,
-    "epochs": 30,
+    "epochs": 20,
     "lr": 5e-3,
     "num_candidates": 5,  # 单组候选动作数量
     "sampling_workers": 2,
     "max_train_samples_per_epoch": 50,
     "dpo_beta": 0.1,
-    "repeat_threshold": 0.95,
-    "history_cache_size": 2,
+    "repeat_threshold": 0.97,
+    "history_cache_size": 0,
     # 【核心删除】移除use_candidates（不再区分candidates1/candidates2）
     "embed_dim_gen": 128,
     "nhead_gen": 8,
