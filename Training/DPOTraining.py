@@ -30,7 +30,7 @@ CONFIG = {
     "action_match_tolerance": 1e-4,  # 动作匹配的容差（处理浮点数精度）
 
     "batch_size": 1,
-    "epochs": 10,
+    "epochs": 30,
     "lr": 5e-3,
     "num_candidates": 5,  # 生成的候选动作数量（单组）
     "sampling_workers": 2,
