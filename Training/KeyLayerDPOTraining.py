@@ -41,7 +41,7 @@ CONFIG = {
 
     "batch_size": 1,
     "epochs": 10,
-    "lr": 1e-4,
+    "lr": 8e-5,
     "num_candidates": 5,  # 单组候选动作数量
     "sampling_workers": 2,
     "max_train_samples_per_epoch": 100,
