@@ -36,7 +36,7 @@ CONFIG = {
     "sampling_workers": 2,
     "dpo_beta": 0.1,
     "repeat_threshold": 0.97,  # 动作重复判断阈值
-    "history_cache_size": 3,  # 增加历史缓存大小，更准确判断重复
+    "history_cache_size": 0,  # 增加历史缓存大小，更准确判断重复
     "embed_dim_gen": 128,
     "nhead_gen": 8,
     "num_layers_gen": 16,
