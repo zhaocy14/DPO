@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 
 # 设备初始化
-device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 print(f"[初始化] 使用设备: {device}")
 
 # ---------------------- 核心配置参数（删除use_candidates，适配单组动作） ----------------------
