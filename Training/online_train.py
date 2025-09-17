@@ -30,7 +30,7 @@ CONFIG = {
     "Q": 5,
     "similarity_threshold": 0.85,
     "batch_size": 1,
-    "total_frames": 5000,
+    "total_frames": 1500,
     "lr": 5e-4,
     "num_candidates": 5,
     "sampling_workers": 2,
