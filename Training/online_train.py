@@ -35,8 +35,8 @@ CONFIG = {
     "num_candidates": 5,
     "sampling_workers": 2,
     "dpo_beta": 0.1,
-    "repeat_threshold": 0.97,
-    "history_cache_size": 1,
+    "repeat_threshold": 0.97,  # 动作重复判断阈值
+    "history_cache_size": 3,  # 增加历史缓存大小，更准确判断重复
     "embed_dim_gen": 128,
     "nhead_gen": 8,
     "num_layers_gen": 16,
@@ -51,7 +51,9 @@ CONFIG = {
     "pretrained_model_path": "./saved_models/best_model",
     "save_path": "./saved_models/inference_train_loop_model",
     "stats_path": "./loss_records/inference_train_stats.npy",
-    "save_interval": 500
+    "save_interval": 500,
+    "window_size": 5,  # 将窗口大小设为配置参数，方便调整
+    "debug_mode": False  # 调试模式开关
 }
 
 # 创建保存目录
@@ -437,18 +439,34 @@ def get_model_highest_prob_action(candidates: list[torch.Tensor],
     return highest_prob_action, probs_tensor
 
 
-def is_action_repeated(current_action: torch.Tensor, history_actions: list[torch.Tensor]) -> bool:
+def is_action_repeated(current_action: torch.Tensor, history_actions: list[torch.Tensor]) -> tuple[bool, float]:
+    """
+    判断当前动作是否与历史动作重复
+
+    返回值:
+        - 布尔值: 是否重复
+        - 浮点数: 最高相似度值（用于调试）
+    """
     assert current_action.shape == (CONFIG["motor_dim"],), f"current_action维度错误：{current_action.shape}"
+
     if not history_actions:
-        return False
+        return False, 0.0  # 无历史动作，不重复
+
     current_norm = F.normalize(current_action.unsqueeze(0), dim=1)
+    max_similarity = 0.0
+
     for hist_action in history_actions:
         assert hist_action.shape == (CONFIG["motor_dim"],), f"历史动作维度错误：{hist_action.shape}"
         hist_norm = F.normalize(hist_action.unsqueeze(0), dim=1)
         sim = F.cosine_similarity(current_norm, hist_norm, dim=1).item()
+
+        if sim > max_similarity:
+            max_similarity = sim
+
         if sim > CONFIG["repeat_threshold"]:
-            return True
-    return False
+            return True, sim  # 找到重复动作，返回
+
+    return False, max_similarity  # 不重复，返回最高相似度
 
 
 def standard_dpo_loss(policy_gen: EncoderOnlyCandidateGenerator,
@@ -487,12 +505,14 @@ def inference_train_loop(data_loader,
     total_loss = 0.0
     processed_frames = 0
     optimized_count = 0
-    history_actions = []
+    history_actions = []  # 存储历史动作，用于判断重复
     batch_size = CONFIG["batch_size"]
+    window_size = CONFIG["window_size"]
 
-    match_window = []
-    match_stats = []
-    total_matches = 0
+    # 滑动窗口统计优化
+    match_window = []  # 存储最近window_size帧的匹配结果
+    match_stats = []  # 存储窗口统计信息
+    total_matches = 0  # 总匹配次数
 
     data_iter = iter(data_loader)
     pbar = tqdm(total=CONFIG["total_frames"], desc="[推理-训练循环] 处理帧")
@@ -510,6 +530,7 @@ def inference_train_loop(data_loader,
             if processed_frames >= CONFIG["total_frames"]:
                 break
 
+            # 1. 提取当前帧数据
             imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = frame
 
             images = torch.stack([imgs1, imgs2], dim=2).to(device)
@@ -518,12 +539,14 @@ def inference_train_loop(data_loader,
             future_driver = future_driver.to(device)
             future_driver_last = future_driver[:, -1, :]
 
+            # 2. 特征嵌入
             with torch.no_grad():
                 image_embedded = image_embed(images)
                 motor_embedded = motor_embed(driver)
                 future_image_embedded = image_embed(future_images)
                 img_proj_future = img_sim_model(future_image_embedded)
 
+            # 3. 生成候选动作
             generator_output = policy_gen(
                 image_embedded=image_embedded,
                 motor_embedded=motor_embedded,
@@ -532,6 +555,7 @@ def inference_train_loop(data_loader,
             )
             candidates = generator_output["candidates"]
 
+            # 4. 选择偏好动作和拒绝动作
             preferred, rejected, _ = select_preferred_rejected(
                 candidates=candidates,
                 img_proj_future=img_proj_future,
@@ -541,6 +565,7 @@ def inference_train_loop(data_loader,
                 batch_size=batch_size
             )
 
+            # 5. 获取模型最高概率动作
             candidates_squeezed = [cand.squeeze(1) for cand in candidates]
             candidates_tensor = torch.stack(candidates_squeezed).permute(1, 0, 2)
             highest_prob_action, _ = get_model_highest_prob_action(
@@ -551,7 +576,7 @@ def inference_train_loop(data_loader,
                 policy_gen=policy_gen
             )
 
-            # 修复：使用bool()转换而不是.item()
+            # 6. 判断preference match
             is_match = bool(torch.allclose(
                 preferred,
                 highest_prob_action,
@@ -562,26 +587,57 @@ def inference_train_loop(data_loader,
             if is_match:
                 total_matches += 1
 
+            # 7. 更新滑动窗口并记录统计信息
+            # 确保窗口始终保持最新的window_size帧
             match_window.append(1 if is_match else 0)
-            if len(match_window) > 5:
-                match_window.pop(0)
+            while len(match_window) > window_size:
+                match_window.pop(0)  # 移除最旧的元素
 
-            if len(match_window) == 5:
+            # 窗口填满后才记录统计信息
+            if len(match_window) == window_size:
                 window_match_count = sum(match_window)
-                match_stats.append({
-                    "frame_idx": processed_frames,
-                    "window_match_count": window_match_count,
-                    "window_size": 5,
-                    "match_rate": window_match_count / 5,
-                    "total_match_rate": total_matches / (processed_frames + 1)
-                })
+                current_window_rate = window_match_count / window_size
+                total_rate = total_matches / (processed_frames + 1) if processed_frames > 0 else 0
 
+                # 记录详细的窗口统计信息
+                window_stats = {
+                    "frame_idx": processed_frames,
+                    "window_content": match_window.copy(),  # 记录窗口具体内容
+                    "window_match_count": window_match_count,
+                    "window_size": window_size,
+                    "window_match_rate": current_window_rate,
+                    "total_match_rate": total_rate
+                }
+                match_stats.append(window_stats)
+
+                # 调试模式下打印窗口变化
+                if CONFIG["debug_mode"]:
+                    print(f"\n[窗口更新] 帧 {processed_frames}: 窗口内容 {match_window}, "
+                          f"匹配率 {current_window_rate:.2%}")
+
+            # 8. 检查动作是否重复
             current_action = preferred.squeeze(0)
-            if is_action_repeated(current_action, history_actions):
+            action_repeated, max_sim = is_action_repeated(current_action, history_actions)
+
+            # 调试模式下打印动作重复信息
+            if CONFIG["debug_mode"] and action_repeated:
+                print(f"[动作重复] 帧 {processed_frames}: 最高相似度 {max_sim:.4f} "
+                      f"(阈值 {CONFIG['repeat_threshold']})")
+
+            # 如果动作重复，跳过训练
+            if action_repeated:
+                # 仍然将当前动作加入历史缓存，用于后续判断
+                history_actions.append(current_action.detach())
+                # 保持历史缓存大小
+                while len(history_actions) > CONFIG["history_cache_size"]:
+                    history_actions.pop(0)
+
                 processed_frames += 1
                 pbar.update(1)
                 continue
 
+            # 9. 执行训练步骤
+            # 识别关键层并选择训练层
             key_layers = identify_key_layers(
                 policy_generator=policy_gen,
                 frame=frame,
@@ -594,6 +650,7 @@ def inference_train_loop(data_loader,
                 key_layers=key_layers
             )
 
+            # 计算损失并优化
             optimizer.zero_grad()
             loss = standard_dpo_loss(
                 policy_gen=policy_gen,
@@ -606,13 +663,16 @@ def inference_train_loop(data_loader,
             loss.backward()
             optimizer.step()
 
+            # 10. 更新历史动作缓存
             history_actions.append(current_action.detach())
-            if len(history_actions) > CONFIG["history_cache_size"]:
-                history_actions.pop(0)
+            while len(history_actions) > CONFIG["history_cache_size"]:
+                history_actions.pop(0)  # 保持缓存大小
 
+            # 11. 累计训练统计
             total_loss += loss.item()
             optimized_count += 1
 
+            # 12. 定期保存模型
             if (processed_frames + 1) % CONFIG["save_interval"] == 0:
                 torch.save({
                     "frame": processed_frames + 1,
@@ -626,13 +686,15 @@ def inference_train_loop(data_loader,
                 }, f"{CONFIG['save_path']}_frame_{processed_frames + 1}.pth")
                 print(f"\n[保存模型] 已保存第{processed_frames + 1}帧模型")
 
+            # 13. 更新进度条
             processed_frames += 1
-            window_stats = f"5帧匹配: {sum(match_window)}/{len(match_window)}" if match_window else ""
+            # 显示窗口内容和统计信息
+            window_content = f"窗口: {match_window}" if match_window else ""
             pbar.set_postfix({
                 "DPO损失": f"{loss.item():.4f}",
                 "优化帧数": optimized_count,
-                "总匹配率": f"{total_matches / processed_frames:.2%}" if processed_frames > 0 else "N/A",
-                "窗口统计": window_stats
+                "总匹配率": f"{(total_matches / processed_frames):.2%}" if processed_frames > 0 else "N/A",
+                window_content: f"{sum(match_window)}/{len(match_window)}" if match_window else ""
             })
             pbar.update(1)
 
@@ -640,6 +702,7 @@ def inference_train_loop(data_loader,
     avg_loss = total_loss / optimized_count if optimized_count > 0 else 0.0
     overall_match_rate = total_matches / processed_frames if processed_frames > 0 else 0.0
 
+    # 保存最终模型和统计结果
     torch.save({
         "frame": processed_frames,
         "policy_generator_state_dict": policy_gen.state_dict(),
@@ -658,7 +721,8 @@ def inference_train_loop(data_loader,
         "avg_loss": avg_loss,
         "total_matches": total_matches,
         "overall_match_rate": overall_match_rate,
-        "match_stats": match_stats
+        "match_stats": match_stats,
+        "config_used": CONFIG  # 保存使用的配置参数
     }
     np.save(CONFIG["stats_path"], stats)
 
@@ -671,9 +735,11 @@ def main():
     print("\n" + "=" * 60)
     print("          推理-训练循环模式：连续处理帧数据")
     print("=" * 60)
-    print(
-        f"[配置信息] 总帧数: {CONFIG['total_frames']}, 关键层参数: P={CONFIG['P']}, Q={CONFIG['Q']}")
-    print(f"[配置信息] 每5帧窗口统计preference match次数")
+    print(f"[配置信息] 总帧数: {CONFIG['total_frames']}, 窗口大小: {CONFIG['window_size']}")
+    print(f"[配置信息] 关键层参数: P={CONFIG['P']}, Q={CONFIG['Q']}")
+    print(f"[配置信息] 动作重复阈值: {CONFIG['repeat_threshold']}, 历史缓存大小: {CONFIG['history_cache_size']}")
+    if CONFIG["debug_mode"]:
+        print("[注意] 调试模式已开启，将输出详细过程信息")
 
     try:
         image_embed, motor_embed, policy_generator, ref_generator, img_sim_model, driver_sim_model = load_pretrained_models(
@@ -716,4 +782,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
