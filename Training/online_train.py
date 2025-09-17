@@ -22,10 +22,6 @@ from tqdm import tqdm
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 print(f"[初始化] 使用设备: {device}")
 
-# 设备初始化
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-print(f"[初始化] 使用设备: {device}")
-
 # ---------------------- 核心配置参数 ----------------------
 CONFIG = {
     "alpha": 0.9,
@@ -355,12 +351,11 @@ def get_generator_distribution(generator: EncoderOnlyCandidateGenerator,
     return mean, std
 
 
-# 修复：添加driver_sim_model作为参数
 def select_preferred_rejected(candidates: list[torch.Tensor],
                               img_proj_future: torch.Tensor,
                               future_driver_last: torch.Tensor,
                               motor_embed: MotorEmbedding,
-                              driver_sim_model: SimilarityModelDriver,  # 新增参数
+                              driver_sim_model: SimilarityModelDriver,
                               batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert len(candidates) == CONFIG["num_candidates"], f"候选数={len(candidates)}，需为{CONFIG['num_candidates']}"
     for i, cand in enumerate(candidates):
@@ -376,7 +371,6 @@ def select_preferred_rejected(candidates: list[torch.Tensor],
 
     sim_img = []
     for emb in candidate_embeddings:
-        # 现在可以正确引用driver_sim_model了
         cand_proj = driver_sim_model(emb).squeeze(1)
         img_proj_squeezed = img_proj_future.squeeze(1)
         sim = F.cosine_similarity(cand_proj, img_proj_squeezed, dim=1)
@@ -488,7 +482,7 @@ def inference_train_loop(data_loader,
                          motor_embed,
                          image_embed,
                          img_sim_model,
-                         driver_sim_model):  # 确保该参数被传入
+                         driver_sim_model):
     policy_gen.train()
     total_loss = 0.0
     processed_frames = 0
@@ -538,13 +532,12 @@ def inference_train_loop(data_loader,
             )
             candidates = generator_output["candidates"]
 
-            # 修复：传入driver_sim_model参数
             preferred, rejected, _ = select_preferred_rejected(
                 candidates=candidates,
                 img_proj_future=img_proj_future,
                 future_driver_last=future_driver_last,
                 motor_embed=motor_embed,
-                driver_sim_model=driver_sim_model,  # 新增参数
+                driver_sim_model=driver_sim_model,
                 batch_size=batch_size
             )
 
@@ -558,12 +551,13 @@ def inference_train_loop(data_loader,
                 policy_gen=policy_gen
             )
 
-            is_match = torch.allclose(
+            # 修复：使用bool()转换而不是.item()
+            is_match = bool(torch.allclose(
                 preferred,
                 highest_prob_action,
                 atol=CONFIG["action_match_tolerance"],
                 rtol=0
-            ).item()
+            ))
 
             if is_match:
                 total_matches += 1
@@ -682,7 +676,6 @@ def main():
     print(f"[配置信息] 每5帧窗口统计preference match次数")
 
     try:
-        # 加载模型时获取driver_sim_model
         image_embed, motor_embed, policy_generator, ref_generator, img_sim_model, driver_sim_model = load_pretrained_models(
             CONFIG["pretrained_model_path"]
         )
@@ -698,7 +691,6 @@ def main():
     )
 
     print("\n[开始循环] 进入推理-训练模式...")
-    # 确保将driver_sim_model传入循环函数
     stats = inference_train_loop(
         data_loader=data_loader,
         policy_gen=policy_generator,
@@ -707,7 +699,7 @@ def main():
         motor_embed=motor_embed,
         image_embed=image_embed,
         img_sim_model=img_sim_model,
-        driver_sim_model=driver_sim_model  # 确保传入该参数
+        driver_sim_model=driver_sim_model
     )
 
     total_time = time.time() - start_time
