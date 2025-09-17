@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+# 路径配置
+pwd = os.path.abspath(os.path.abspath(__file__))
+father_path = os.path.abspath(os.path.dirname(pwd) + os.path.sep + "..")
+sys.path.append(father_path)
 import time
 import torch
 from torch import nn
