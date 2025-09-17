@@ -22,29 +22,29 @@ from tqdm import tqdm
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 print(f"[初始化] 使用设备: {device}")
 
-# ---------------------- 核心配置参数（适配推理-训练循环） ----------------------
+# 设备初始化
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+print(f"[初始化] 使用设备: {device}")
+
+# ---------------------- 核心配置参数 ----------------------
 CONFIG = {
-    # 相似度加权系数
     "alpha": 0.9,
     "action_match_tolerance": 1e-4,
-
-    # 关键层识别参数
-    "P": 3,  # 倒数P层特殊处理
-    "Q": 5,  # 每次训练随机选择Q个关键层更新
-    "similarity_threshold": 0.85,  # 80%相似度阈值
-
+    "P": 3,
+    "Q": 5,
+    "similarity_threshold": 0.85,
     "batch_size": 1,
-    "total_frames": 5000,  # 总处理帧数
+    "total_frames": 5000,
     "lr": 5e-4,
-    "num_candidates": 5,  # 单组候选动作数量
+    "num_candidates": 5,
     "sampling_workers": 2,
     "dpo_beta": 0.1,
     "repeat_threshold": 0.97,
     "history_cache_size": 1,
     "embed_dim_gen": 128,
     "nhead_gen": 8,
-    "num_layers_gen": 16,  # Transformer层数
-    "motor_dim": 2,  # 单组动作含2个电机信号
+    "num_layers_gen": 16,
+    "motor_dim": 2,
     "gen_seq_len": 30,
     "sim_seq_len": 30,
     "embed_dim_sim": 128,
@@ -54,8 +54,8 @@ CONFIG = {
     "data_root_dirs": '/data/cyzhao/collector_cydpo/dpo_data',
     "pretrained_model_path": "./saved_models/best_model",
     "save_path": "./saved_models/inference_train_loop_model",
-    "stats_path": "./loss_records/inference_train_stats.npy",  # 记录统计信息
-    "save_interval": 500  # 每处理多少帧保存一次模型
+    "stats_path": "./loss_records/inference_train_stats.npy",
+    "save_interval": 500
 }
 
 # 创建保存目录
@@ -63,7 +63,7 @@ os.makedirs(os.path.dirname(CONFIG["save_path"]), exist_ok=True)
 os.makedirs(os.path.dirname(CONFIG["stats_path"]), exist_ok=True)
 
 
-# # ---------------------- Transformer相关模型定义 ----------------------
+# ---------------------- 模型定义 ----------------------
 class TransformerEncoderModel(nn.Module):
     def __init__(self, embed_dim=64, nhead=8, num_layers=16):
         super(TransformerEncoderModel, self).__init__()
@@ -89,7 +89,7 @@ class TransformerEncoderModel(nn.Module):
                     current = layer(current)
             layer_outputs.append(current)
 
-        return layer_outputs  # [num_layers, batch, seq, 3*embed_dim]
+        return layer_outputs
 
 
 class EncoderOnlyCandidateGenerator(nn.Module):
@@ -130,7 +130,7 @@ class EncoderOnlyCandidateGenerator(nn.Module):
         }
 
 
-# ---------------------- 1. 模型加载 ----------------------
+# ---------------------- 模型加载 ----------------------
 def load_pretrained_models(pretrained_path):
     image_embed = ImageEmbedding(
         embed_dim=CONFIG["embed_dim_gen"],
@@ -194,7 +194,7 @@ def load_pretrained_models(pretrained_path):
     return image_embed, motor_embed, policy_generator, ref_generator, img_sim_model, driver_sim_model
 
 
-# ---------------------- 2. 数据加载（循环获取帧） ----------------------
+# ---------------------- 数据加载 ----------------------
 def load_dataset():
     data_root = CONFIG["data_root_dirs"]
     if not os.path.exists(data_root):
@@ -212,12 +212,11 @@ def load_dataset():
             predict_len=CONFIG["sim_seq_len"],
             show=True
         )
-        dataset = all_dataset.training_dataset  # 只使用训练集数据
+        dataset = all_dataset.training_dataset
         print(f"[数据加载] 数据集规模：{len(dataset)}样本")
     except Exception as e:
         raise RuntimeError(f"[数据集加载失败] {str(e)}") from e
 
-    # 数据加载器，batch_size设为1
     data_loader = DataLoader(
         dataset=dataset,
         batch_size=1,
@@ -230,7 +229,6 @@ def load_dataset():
     return data_loader
 
 
-# 辅助函数：将样本拆分为帧序列
 def split_sample_into_frames(sample):
     imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = sample
     seq_len = imgs1.shape[1]
@@ -250,7 +248,7 @@ def split_sample_into_frames(sample):
     return frames
 
 
-# ---------------------- 3. 核心工具函数 ----------------------
+# ---------------------- 核心工具函数 ----------------------
 def calculate_layer_similarity(layer_outputs):
     num_layers = len(layer_outputs)
     similarity_matrix = torch.zeros(num_layers, num_layers, device=device)
@@ -357,10 +355,12 @@ def get_generator_distribution(generator: EncoderOnlyCandidateGenerator,
     return mean, std
 
 
+# 修复：添加driver_sim_model作为参数
 def select_preferred_rejected(candidates: list[torch.Tensor],
                               img_proj_future: torch.Tensor,
                               future_driver_last: torch.Tensor,
                               motor_embed: MotorEmbedding,
+                              driver_sim_model: SimilarityModelDriver,  # 新增参数
                               batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert len(candidates) == CONFIG["num_candidates"], f"候选数={len(candidates)}，需为{CONFIG['num_candidates']}"
     for i, cand in enumerate(candidates):
@@ -376,6 +376,7 @@ def select_preferred_rejected(candidates: list[torch.Tensor],
 
     sim_img = []
     for emb in candidate_embeddings:
+        # 现在可以正确引用driver_sim_model了
         cand_proj = driver_sim_model(emb).squeeze(1)
         img_proj_squeezed = img_proj_future.squeeze(1)
         sim = F.cosine_similarity(cand_proj, img_proj_squeezed, dim=1)
@@ -479,7 +480,7 @@ def standard_dpo_loss(policy_gen: EncoderOnlyCandidateGenerator,
     return -F.logsigmoid(CONFIG["dpo_beta"] * advantage).mean()
 
 
-# ---------------------- 4. 推理-训练循环 ----------------------
+# ---------------------- 推理-训练循环 ----------------------
 def inference_train_loop(data_loader,
                          policy_gen,
                          ref_gen,
@@ -487,42 +488,34 @@ def inference_train_loop(data_loader,
                          motor_embed,
                          image_embed,
                          img_sim_model,
-                         driver_sim_model):
-    """持续进行推理-训练循环"""
-    policy_gen.train()  # 始终保持训练模式
+                         driver_sim_model):  # 确保该参数被传入
+    policy_gen.train()
     total_loss = 0.0
     processed_frames = 0
     optimized_count = 0
     history_actions = []
     batch_size = CONFIG["batch_size"]
 
-    # 5帧窗口匹配统计
     match_window = []
     match_stats = []
     total_matches = 0
 
-    # 创建数据迭代器，用完后重新循环
     data_iter = iter(data_loader)
-
     pbar = tqdm(total=CONFIG["total_frames"], desc="[推理-训练循环] 处理帧")
 
     while processed_frames < CONFIG["total_frames"]:
         try:
-            # 获取下一个样本
             sample = next(data_iter)
         except StopIteration:
-            # 数据迭代完了，重新创建迭代器
             data_iter = iter(data_loader)
             sample = next(data_iter)
 
-        # 将样本拆分为帧
         frames = split_sample_into_frames(sample)
 
         for frame in frames:
             if processed_frames >= CONFIG["total_frames"]:
                 break
 
-            # 1. 推理阶段：处理当前帧并生成动作
             imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = frame
 
             images = torch.stack([imgs1, imgs2], dim=2).to(device)
@@ -531,14 +524,12 @@ def inference_train_loop(data_loader,
             future_driver = future_driver.to(device)
             future_driver_last = future_driver[:, -1, :]
 
-            # 特征嵌入
             with torch.no_grad():
                 image_embedded = image_embed(images)
                 motor_embedded = motor_embed(driver)
                 future_image_embedded = image_embed(future_images)
                 img_proj_future = img_sim_model(future_image_embedded)
 
-            # 生成候选动作
             generator_output = policy_gen(
                 image_embedded=image_embedded,
                 motor_embedded=motor_embedded,
@@ -547,16 +538,16 @@ def inference_train_loop(data_loader,
             )
             candidates = generator_output["candidates"]
 
-            # 选择偏好动作
+            # 修复：传入driver_sim_model参数
             preferred, rejected, _ = select_preferred_rejected(
                 candidates=candidates,
                 img_proj_future=img_proj_future,
                 future_driver_last=future_driver_last,
                 motor_embed=motor_embed,
+                driver_sim_model=driver_sim_model,  # 新增参数
                 batch_size=batch_size
             )
 
-            # 获取模型最高概率动作并检查匹配
             candidates_squeezed = [cand.squeeze(1) for cand in candidates]
             candidates_tensor = torch.stack(candidates_squeezed).permute(1, 0, 2)
             highest_prob_action, _ = get_model_highest_prob_action(
@@ -567,7 +558,6 @@ def inference_train_loop(data_loader,
                 policy_gen=policy_gen
             )
 
-            # 检查preference match
             is_match = torch.allclose(
                 preferred,
                 highest_prob_action,
@@ -578,12 +568,10 @@ def inference_train_loop(data_loader,
             if is_match:
                 total_matches += 1
 
-            # 更新匹配窗口统计
             match_window.append(1 if is_match else 0)
             if len(match_window) > 5:
                 match_window.pop(0)
 
-            # 记录窗口统计
             if len(match_window) == 5:
                 window_match_count = sum(match_window)
                 match_stats.append({
@@ -594,15 +582,12 @@ def inference_train_loop(data_loader,
                     "total_match_rate": total_matches / (processed_frames + 1)
                 })
 
-            # 2. 训练阶段：使用当前帧数据更新模型
-            # 检查动作是否重复
             current_action = preferred.squeeze(0)
             if is_action_repeated(current_action, history_actions):
                 processed_frames += 1
                 pbar.update(1)
                 continue
 
-            # 识别关键层并选择训练层
             key_layers = identify_key_layers(
                 policy_generator=policy_gen,
                 frame=frame,
@@ -615,7 +600,6 @@ def inference_train_loop(data_loader,
                 key_layers=key_layers
             )
 
-            # 计算损失并优化
             optimizer.zero_grad()
             loss = standard_dpo_loss(
                 policy_gen=policy_gen,
@@ -628,16 +612,13 @@ def inference_train_loop(data_loader,
             loss.backward()
             optimizer.step()
 
-            # 更新历史动作缓存
             history_actions.append(current_action.detach())
             if len(history_actions) > CONFIG["history_cache_size"]:
                 history_actions.pop(0)
 
-            # 累计损失
             total_loss += loss.item()
             optimized_count += 1
 
-            # 定期保存模型
             if (processed_frames + 1) % CONFIG["save_interval"] == 0:
                 torch.save({
                     "frame": processed_frames + 1,
@@ -651,7 +632,6 @@ def inference_train_loop(data_loader,
                 }, f"{CONFIG['save_path']}_frame_{processed_frames + 1}.pth")
                 print(f"\n[保存模型] 已保存第{processed_frames + 1}帧模型")
 
-            # 更新进度
             processed_frames += 1
             window_stats = f"5帧匹配: {sum(match_window)}/{len(match_window)}" if match_window else ""
             pbar.set_postfix({
@@ -666,7 +646,6 @@ def inference_train_loop(data_loader,
     avg_loss = total_loss / optimized_count if optimized_count > 0 else 0.0
     overall_match_rate = total_matches / processed_frames if processed_frames > 0 else 0.0
 
-    # 保存最终模型和统计结果
     torch.save({
         "frame": processed_frames,
         "policy_generator_state_dict": policy_gen.state_dict(),
@@ -678,7 +657,6 @@ def inference_train_loop(data_loader,
         "match_stats": match_stats
     }, f"{CONFIG['save_path']}_final.pth")
 
-    # 保存统计信息
     stats = {
         "total_frames": processed_frames,
         "optimized_frames": optimized_count,
@@ -693,7 +671,7 @@ def inference_train_loop(data_loader,
     return stats
 
 
-# ---------------------- 5. 主函数 ----------------------
+# ---------------------- 主函数 ----------------------
 def main():
     start_time = time.time()
     print("\n" + "=" * 60)
@@ -703,8 +681,8 @@ def main():
         f"[配置信息] 总帧数: {CONFIG['total_frames']}, 关键层参数: P={CONFIG['P']}, Q={CONFIG['Q']}")
     print(f"[配置信息] 每5帧窗口统计preference match次数")
 
-    # 加载模型和数据
     try:
+        # 加载模型时获取driver_sim_model
         image_embed, motor_embed, policy_generator, ref_generator, img_sim_model, driver_sim_model = load_pretrained_models(
             CONFIG["pretrained_model_path"]
         )
@@ -713,15 +691,14 @@ def main():
         print(f"[初始化失败] {str(e)}")
         return
 
-    # 优化器配置
     optimizer = torch.optim.Adam(
         params=policy_generator.parameters(),
         lr=CONFIG["lr"],
         weight_decay=1e-6
     )
 
-    # 开始推理-训练循环
     print("\n[开始循环] 进入推理-训练模式...")
+    # 确保将driver_sim_model传入循环函数
     stats = inference_train_loop(
         data_loader=data_loader,
         policy_gen=policy_generator,
@@ -730,10 +707,9 @@ def main():
         motor_embed=motor_embed,
         image_embed=image_embed,
         img_sim_model=img_sim_model,
-        driver_sim_model=driver_sim_model
+        driver_sim_model=driver_sim_model  # 确保传入该参数
     )
 
-    # 输出总结
     total_time = time.time() - start_time
     print("\n" + "=" * 60)
     print("                          推理-训练循环完成")
@@ -748,3 +724,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
