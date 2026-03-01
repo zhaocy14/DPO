@@ -35,7 +35,7 @@ config = {
     "lr": 1e-5,
     "sampling_workers": 20,
     "max_train_batches": 20,  # 限制训练批次
-    "max_val_batches": 20,    # 限制验证批次
+    "max_val_batches": 20,  # 限制验证批次
 
     # 生成器模型参数
     "embed_dim_gen": 128,
@@ -144,14 +144,6 @@ judge_total_model = JudgeModel(
     judge_dim=config['judge_dim']
 ).to(device)
 
-# 动作提取模型（可选，如需保留）
-action_extract_model = ActionExtract(
-    in_dim=config['judge_dim'],
-    hidden_dim=64,
-    out_dim=config['motor_dim'],
-    dropout_rate=0.2
-).to(device)
-
 # 打印模型大小
 print("=" * 60)
 print("模型大小统计（MB）：")
@@ -163,7 +155,25 @@ print(f"Judge电机模型：{calculate_model_size(judge_driver_model):.2f}")
 print(f"Judge总模型：{calculate_model_size(judge_total_model):.2f}")
 print("=" * 60)
 
-# ======================== 4. 损失函数（保留你的NLL损失 + Judge损失） ========================
+
+# ======================== 4. 核心工具函数：计算候选动作的生成概率 ========================
+def gaussian_pdf(x, mean, std):
+    """
+    计算多维高斯分布的概率密度（PDF）
+    :param x: 候选动作 (batch, motor_dim)
+    :param mean: 生成模型输出的均值 (batch, motor_dim)
+    :param std: 生成模型输出的标准差 (batch, motor_dim)
+    :return: 每个样本的PDF值 (batch,)
+    """
+    eps = 1e-6
+    std = std + eps  # 避免除0
+    # 多维高斯PDF：乘积形式（独立假设）
+    pdf_per_dim = (1 / (torch.sqrt(2 * torch.pi) * std)) * torch.exp(-((x - mean) ** 2) / (2 * std ** 2))
+    pdf = torch.prod(pdf_per_dim, dim=1)  # 各维度乘积 → 整体PDF
+    return pdf
+
+
+# ======================== 5. 损失函数（保留你的NLL损失 + Judge损失） ========================
 def nll_loss(mean, std, target):
     """复用你的负对数似然损失"""
     eps = 1e-6
@@ -171,23 +181,26 @@ def nll_loss(mean, std, target):
     nll = torch.log(std) + (target - mean) ** 2 / (2 * std ** 2)
     return nll.mean()
 
+
 def judge_mse_loss(match_scores, judge_labels):
     """Judge模型的MSE损失（匹配分数 vs one-hot标签）"""
     return F.mse_loss(match_scores, judge_labels)
 
-# ======================== 5. 通用计算函数（损失+准确率） ========================
+
+# ======================== 6. 通用计算函数（核心：基于生成模型概率生成标签） ========================
 def compute_loss_and_metrics(batch):
     """
-    计算损失和Judge准确率（训练/验证通用）
-    :param batch: 从DataLoader获取的批次数据
-    :return: 包含损失、准确率的字典
+    计算损失和Judge准确率
+    核心逻辑：
+    1. 标签 = 生成模型对候选动作的概率（PDF）最大的候选为1，其余为0
+    2. 准确率 = Judge预测的最优候选 VS 生成模型概率最大的候选
     """
     # 1. 解包数据（完全复用你的解包逻辑）
     imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
     images = torch.stack([imgs1, imgs2], dim=2).to(device)  # (batch, seq, 2, 3, H, W)
     future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(device)
     driver = driver.to(device)  # (batch, seq, motor_dim=2)
-    next_driver = future_driver[:, 0, :].to(device)  # 下一个动作 (batch, 2)
+    next_driver = future_driver[:, 0, :].to(device)  # 仅用于生成器NLL损失，不参与Judge标签
     batch_size = images.shape[0]
 
     # 2. 基础特征提取
@@ -202,39 +215,46 @@ def compute_loss_and_metrics(batch):
         num_candidates=config["num_candidates"],
         temperature=1.0
     )
-    mean = outputs['mean']  # (batch, 2)
-    std = outputs['std']    # (batch, 2)
+    mean = outputs['mean']  # (batch, motor_dim=2) → 生成模型的高斯均值
+    std = outputs['std']  # (batch, motor_dim=2) → 生成模型的高斯标准差
 
-    # 4. 构建候选动作特征列表
+    # 4. 核心：计算每个候选动作在生成模型高斯分布下的概率（PDF）
+    candidate_probs = []  # 存储每个候选的概率 (num_candidates, batch)
+    for candidate in outputs['candidates']:
+        # candidate形状: (batch, 1, 2) → 压缩为 (batch, 2)
+        candidate_2d = candidate.squeeze(1)  # (batch, motor_dim)
+        # 计算该候选在生成模型高斯分布下的概率密度
+        prob = gaussian_pdf(candidate_2d, mean, std)  # (batch,)
+        candidate_probs.append(prob)
+
+    # 4.1 转为张量：(num_candidates, batch) → 转置为 (batch, num_candidates)
+    candidate_probs = torch.stack(candidate_probs, dim=0).T  # (batch, num_candidates)
+
+    # 4.2 生成标签：生成模型概率最大的候选为1，其余为0
+    gen_best_indices = torch.argmax(candidate_probs, dim=1)  # (batch,) → 生成模型认为最优的候选索引
+    judge_labels = torch.zeros_like(candidate_probs).to(device)
+    judge_labels.scatter_(1, gen_best_indices.unsqueeze(1), 1.0)  # one-hot标签
+
+    # 5. 构建候选动作特征列表（用于Judge模型）
     candidate_emb_list = []
     for candidate in outputs['candidates']:
-        # candidate形状: (batch, 1, 2)
         candidate_emb = motor_embed(candidate)  # (batch, 1, embed_dim_gen)
         candidate_emb = candidate_emb[:, -1, :]  # (batch, embed_dim_gen)
         candidate_emb_list.append(candidate_emb)
 
-    # 5. Judge模型前向
-    # 5.1 未来图像→Judge特征（32维）
+    # 6. Judge模型前向
     judge_img_feat = judge_image_model(future_image_embedded)  # (batch, judge_dim=32)
-    # 5.2 候选动作→Judge特征（32维）
     judge_driver_feats = [judge_driver_model(emb) for emb in candidate_emb_list]
-    # 5.3 计算匹配分数
     match_scores = judge_total_model(judge_img_feat, judge_driver_feats)  # (batch, num_candidates)
 
-    # 6. 生成Judge标签 + 计算准确率
-    max_indices = torch.argmax(match_scores, dim=1)  # 每个样本的最优候选索引
-    judge_labels = torch.zeros_like(match_scores).to(device)
-    judge_labels.scatter_(1, max_indices.unsqueeze(1), 1.0)  # one-hot标签
+    # 7. 计算Judge准确率（核心：Judge预测 VS 生成模型最优）
+    pred_best_indices = torch.argmax(match_scores, dim=1)  # Judge预测的最优候选索引
+    judge_correct = (pred_best_indices == gen_best_indices).sum().item()  # 对比生成模型的最优索引
+    judge_acc = judge_correct / batch_size  # 真实准确率
 
-    # 6.1 Judge准确率：预测索引 == 标签索引（100%匹配）
-    pred_max_indices = torch.argmax(match_scores, dim=1)
-    label_max_indices = torch.argmax(judge_labels, dim=1)
-    judge_correct = (pred_max_indices == label_max_indices).sum().item()
-    judge_acc = judge_correct / batch_size
-
-    # 7. 损失计算
+    # 8. 损失计算
     gen_loss = nll_loss(mean, std, next_driver)  # 生成器损失（复用你的NLL）
-    judge_loss = judge_mse_loss(match_scores, judge_labels)  # Judge损失
+    judge_loss = judge_mse_loss(match_scores, judge_labels)  # Judge损失（匹配生成模型的概率标签）
     total_loss = gen_loss + judge_loss  # 总损失
 
     return {
@@ -242,10 +262,13 @@ def compute_loss_and_metrics(batch):
         "gen_loss": gen_loss,
         "judge_loss": judge_loss,
         "judge_acc": judge_acc,
-        "batch_size": batch_size
+        "batch_size": batch_size,
+        "gen_best_idx": gen_best_indices,  # 调试用：生成模型最优索引
+        "pred_best_idx": pred_best_indices  # 调试用：Judge预测索引
     }
 
-# ======================== 6. 训练函数（保留你的批次限制 + 进度条） ========================
+
+# ======================== 7. 训练函数（保留你的批次限制 + 进度条） ========================
 def train_one_epoch(epoch, optimizer):
     """单轮训练（复用你的tqdm进度条 + 批次限制）"""
     # 模型训练模式
@@ -311,7 +334,8 @@ def train_one_epoch(epoch, optimizer):
         "judge_acc": avg_judge_acc
     }
 
-# ======================== 7. 验证函数（保留你的批次限制 + 进度条） ========================
+
+# ======================== 8. 验证函数（保留你的批次限制 + 进度条） ========================
 def validate_one_epoch(epoch):
     """单轮验证（复用你的tqdm进度条 + 批次限制）"""
     # 模型评估模式
@@ -374,7 +398,8 @@ def validate_one_epoch(epoch):
         "judge_acc": avg_judge_acc
     }
 
-# ======================== 8. 主训练流程（复用你的逻辑 + 新增Judge指标） ========================
+
+# ======================== 9. 主训练流程（复用你的逻辑 + 新增Judge指标） ========================
 def main():
     # 优化器（复用你的参数分组 + 学习率）
     optimizer = torch.optim.Adam(
@@ -435,8 +460,10 @@ def main():
         # 打印epoch信息（复用你的格式 + 新增Judge准确率）
         print("\n" + "=" * 30)
         print(f"Epoch {epoch + 1}/{config['epochs']} | 耗时：{epoch_time:.2f}秒")
-        print(f"【训练集】总损失：{train_metrics['total_loss']:.4f} | 生成损失：{train_metrics['gen_loss']:.4f} | Judge损失：{train_metrics['judge_loss']:.4f} | Judge准确率：{train_metrics['judge_acc']:.2%}")
-        print(f"【验证集】总损失：{val_metrics['total_loss']:.4f} | 生成损失：{val_metrics['gen_loss']:.4f} | Judge损失：{val_metrics['judge_loss']:.4f} | Judge准确率：{val_metrics['judge_acc']:.2%}")
+        print(
+            f"【训练集】总损失：{train_metrics['total_loss']:.4f} | 生成损失：{train_metrics['gen_loss']:.4f} | Judge损失：{train_metrics['judge_loss']:.4f} | Judge准确率：{train_metrics['judge_acc']:.2%}")
+        print(
+            f"【验证集】总损失：{val_metrics['total_loss']:.4f} | 生成损失：{val_metrics['gen_loss']:.4f} | Judge损失：{val_metrics['judge_loss']:.4f} | Judge准确率：{val_metrics['judge_acc']:.2%}")
         print("=" * 30 + "\n")
 
         # 保存最佳模型（基于验证总损失）
@@ -461,7 +488,8 @@ def main():
                 "config": config
             }, best_model_path)
 
-            print(f"✅ 保存最佳模型（验证总损失：{best_val_loss:.4f} | 验证Judge准确率：{best_val_judge_acc:.2%}）至：{best_model_path}")
+            print(
+                f"✅ 保存最佳模型（验证总损失：{best_val_loss:.4f} | 验证Judge准确率：{best_val_judge_acc:.2%}）至：{best_model_path}")
 
     # 保存损失和准确率记录
     record_save_path = os.path.join(config["loss_data_path"], "train_val_records.npy")
@@ -475,6 +503,7 @@ def main():
     print(f"最佳模型路径：{os.path.join(config['save_path'], 'best_model')}")
     print(f"记录保存路径：{record_save_path}")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()
