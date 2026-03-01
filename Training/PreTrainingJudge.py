@@ -156,10 +156,11 @@ print(f"Judge总模型：{calculate_model_size(judge_total_model):.2f}")
 print("=" * 60)
 
 
-# ======================== 4. 核心工具函数：计算候选动作的生成概率 ========================
+# ======================== 4. 核心工具函数：修正高斯PDF计算（解决Tensor类型错误） ========================
 def gaussian_pdf(x, mean, std):
     """
     计算多维高斯分布的概率密度（PDF）
+    修正点：将所有常量转为与std同设备、同类型的Tensor，避免类型错误
     :param x: 候选动作 (batch, motor_dim)
     :param mean: 生成模型输出的均值 (batch, motor_dim)
     :param std: 生成模型输出的标准差 (batch, motor_dim)
@@ -167,8 +168,13 @@ def gaussian_pdf(x, mean, std):
     """
     eps = 1e-6
     std = std + eps  # 避免除0
+
+    # 关键修正：将常量转为Tensor，且与std同设备、同数据类型
+    two_pi = torch.tensor(2 * np.pi, dtype=std.dtype, device=std.device)  # 2π转为Tensor
+    sqrt_two_pi = torch.sqrt(two_pi)  # 此时输入是Tensor，不会报错
+
     # 多维高斯PDF：乘积形式（独立假设）
-    pdf_per_dim = (1 / (torch.sqrt(2 * torch.pi) * std)) * torch.exp(-((x - mean) ** 2) / (2 * std ** 2))
+    pdf_per_dim = (1 / (sqrt_two_pi * std)) * torch.exp(-((x - mean) ** 2) / (2 * std ** 2))
     pdf = torch.prod(pdf_per_dim, dim=1)  # 各维度乘积 → 整体PDF
     return pdf
 
