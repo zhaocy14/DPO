@@ -41,7 +41,7 @@ class Config:
 
     # 训练配置
     lr = 1e-4
-    epochs = 100
+    epochs = 1
     weight_decay = 1e-5
     temperature = 0.5  # 候选生成温度系数
     save_interval = 10  # 模型保存间隔
