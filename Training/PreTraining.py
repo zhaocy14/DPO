@@ -141,7 +141,7 @@ optimizer = torch.optim.Adam(
     ],
     lr=config['lr']
 )
-sch = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+sch = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
 
 
 def nll_loss(mean, std, target):
@@ -290,7 +290,7 @@ def train_one_epoch(epoch):
         sim_loss = info_ce_loss(img_proj, candidate_projections)
 
         # 【修改4】总损失 = 生成损失 + 相似度损失 + 反向MSE损失
-        loss = gen_loss + sim_loss + reverse_mse_loss_val
+        loss = gen_loss + sim_loss + reverse_mse_loss_val * 0
         loss.backward()
         optimizer.step()
 
