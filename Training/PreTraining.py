@@ -30,12 +30,12 @@ print(f"使用设备: {device}")
 # 配置参数
 config = {
     # 训练参数
-    "batch_size": 4,
+    "batch_size": 8,
     "epochs": 100,
     "lr": 5e-5,
     "sampling_workers": 20,
-    "reverse_mse_weight": 0.0,
-    "sim_loss_weight": 5.0,
+    "reverse_mse_weight": 0.1,
+    "sim_loss_weight": 2.0,
     # ===================== 新增：相似度损失类型选择 =====================
     "sim_loss_type": "cos_sim",  # 可选："info_ce"（原有） / "cos_sim"（新）
     "info_ce_temperature": 0.07,  # InfoCE的温度参数（保留）
