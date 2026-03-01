@@ -7,8 +7,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-# 路径配置（确保能导入Models.py）
-pwd = os.path.abspath(os.path.dirname(__file__))
+# 路径配置
+pwd = os.path.abspath(os.path.abspath(__file__))
 father_path = os.path.abspath(os.path.dirname(pwd) + os.path.sep + "..")
 sys.path.append(father_path)
 
