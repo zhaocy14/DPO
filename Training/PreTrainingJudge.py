@@ -437,11 +437,11 @@ def main():
             {'params': motor_embed.parameters()},
             {'params': candidate_generator.parameters()},
             # Judge模型单独高lr
-            {'params': judge_image_model.parameters(), 'lr': 1e-4},
-            {'params': judge_driver_model.parameters(), 'lr': 1e-4},
-            {'params': judge_total_model.parameters(), 'lr': 1e-4},
+            {'params': judge_image_model.parameters(), 'lr': 1e-5},
+            {'params': judge_driver_model.parameters(), 'lr': 1e-5},
+            {'params': judge_total_model.parameters(), 'lr': 1e-5},
             # ActionExtract模型参数（新增）
-            {'params': action_extract_model.parameters(), 'lr': 1e-4}
+            {'params': action_extract_model.parameters(), 'lr': 1e-5}
         ],
         lr=config['lr']  # 生成模型lr=1e-5
     )
