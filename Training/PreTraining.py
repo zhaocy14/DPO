@@ -170,6 +170,8 @@ def info_ce_loss(img_proj, candidate_projections, temperature=0.1):
     batch_size = img_proj.shape[0]
     candidates = torch.stack(candidate_projections, dim=1)  # (batch, num_candidates, similarity_dim)
 
+    img_proj = F.normalize(img_proj, p=2, dim=-1)
+    candidates = F.normalize(candidates, p=2, dim=-1)
     # 计算图像投影与候选动作投影的余弦相似度
     similarities = F.cosine_similarity(
         img_proj.unsqueeze(1),  # (batch, 1, similarity_dim)
