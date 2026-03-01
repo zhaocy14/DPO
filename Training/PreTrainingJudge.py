@@ -149,9 +149,9 @@ judge_total_model = JudgeModel(
 
 # 补充ActionExtract模型（核心新增）
 action_extract_model = ActionExtract(
-    input_dim=config['judge_dim'],  # 输入=judge_image_model的输出维度
+    in_dim=config['judge_dim'],  # 输入=judge_image_model的输出维度
     hidden_dim=config['action_extract_dim'],
-    output_dim=config['action_extract_out_dim']  # 输出动作维度
+    out_dim=config['action_extract_out_dim']  # 输出动作维度
 ).to(device)
 
 # 打印模型大小（含ActionExtract）
