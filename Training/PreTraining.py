@@ -233,7 +233,7 @@ def train_one_epoch(epoch):
     total_reverse_mse_loss = 0.0
     total_loss = 0.0
 
-    max_train_batches = 20
+    max_train_batches = 50
     batch_count = 0
 
     pbar = tqdm(
@@ -366,7 +366,7 @@ def validate_one_epoch(epoch):
     total_reverse_mse_loss = 0.0
     total_loss = 0.0
 
-    max_val_batches = 20
+    max_val_batches = 100
     batch_count = 0
 
     pbar = tqdm(
