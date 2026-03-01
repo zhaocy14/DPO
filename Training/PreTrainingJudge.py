@@ -34,8 +34,8 @@ config = {
     "epochs": 100,
     "lr": 1e-5,
     "sampling_workers": 20,
-    "max_train_batches": 20,  # 可后续改为len(train_loader)
-    "max_val_batches": 20,  # 可后续改为len(val_loader)
+    "max_train_batches": 45,  # 可后续改为len(train_loader)
+    "max_val_batches": 45,  # 可后续改为len(val_loader)
 
     # 生成器模型参数
     "embed_dim_gen": 128,
