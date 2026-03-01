@@ -7,7 +7,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-# 路径配置
+# 路径配置（确保能导入Models.py）
 pwd = os.path.abspath(os.path.abspath(__file__))
 father_path = os.path.abspath(os.path.dirname(pwd) + os.path.sep + "..")
 sys.path.append(father_path)
@@ -29,11 +29,11 @@ class Config:
     batch_size = 4
     seq_length = 30  # 图像序列长度
     motor_dim = 2  # 电机动作维度
-    num_candidates = 5  # 生成的候选动作数量（仅用这些动作训练Judge Model）
+    num_candidates = 5  # 生成的候选动作数量
 
     # 模型配置
     embed_dim_gen = 128  # 基础嵌入维度
-    judge_dim = 32  # 判断模型输出维度（核心：解决32/256维度不匹配）
+    judge_dim = 32  # 判断模型输出维度
     num_layers_gen = 16  # 生成器Transformer层数
     nhead_gen = 8  # 生成器注意力头数
     num_layers_judge = 2  # 判断模型Transformer层数
@@ -45,17 +45,21 @@ class Config:
     weight_decay = 1e-5
     temperature = 0.5  # 候选生成温度系数
     save_interval = 10  # 模型保存间隔
+    val_split = 0.2  # 训练/验证数据分割比例
 
 
 config = Config()
 
 
-# ======================== 2. 模拟数据集（替换为你的真实数据集） ========================
+# ======================== 2. 数据集（训练+验证） ========================
 class PretrainDataset(Dataset):
-    def __init__(self, num_samples=1000, seq_length=30, motor_dim=2):
+    def __init__(self, num_samples=1000, seq_length=30, motor_dim=2, is_train=True):
         self.num_samples = num_samples
         self.seq_length = seq_length
         self.motor_dim = motor_dim
+        self.is_train = is_train
+        # 固定随机种子，确保验证集数据稳定
+        torch.manual_seed(42 if is_train else 100)
 
     def __len__(self):
         return self.num_samples
@@ -67,7 +71,7 @@ class PretrainDataset(Dataset):
         motor_data = torch.randn(self.seq_length, self.motor_dim)
         # 模拟未来图像（用于判断模型）：(seq, 2, 3, 64, 64)
         future_images = torch.randn(self.seq_length, 2, 3, 64, 64)
-        # 模拟真实电机信号（仅用于ActionExtract损失，非Judge Model）
+        # 模拟真实电机信号（仅用于ActionExtract损失）
         real_motor_signal = torch.randn(self.motor_dim)
 
         return {
@@ -102,7 +106,7 @@ def init_models():
         max_seq_length=config.seq_length
     ).to(config.device)
 
-    # 判断模型（核心：指定judge_dim=32）
+    # 判断模型
     judge_image_model = JudgeModelImage(
         embed_dim=config.embed_dim_gen,
         num_frames=config.seq_length,
@@ -124,7 +128,7 @@ def init_models():
         judge_dim=config.judge_dim
     ).to(config.device)
 
-    # 动作提取模型（输入维度=judge_dim=32）
+    # 动作提取模型
     action_extract_model = ActionExtract(
         in_dim=config.judge_dim,
         hidden_dim=64,
@@ -155,10 +159,77 @@ def init_models():
     }
 
 
-# ======================== 4. 训练函数（核心修改：Judge Model 标签逻辑） ========================
+# ======================== 4. 训练/验证通用函数（计算损失+准确率） ========================
+def compute_loss_and_metrics(model_dict, batch_data):
+    """计算损失和Judge准确率（训练/验证通用）"""
+    # 1. 数据预处理
+    images = batch_data["images"].to(config.device)
+    motor_data = batch_data["motor_data"].to(config.device)
+    future_images = batch_data["future_images"].to(config.device)
+    real_motor_signal = batch_data["real_motor_signal"].to(config.device)
+
+    batch_size = images.shape[0]
+
+    # 2. 基础特征提取
+    image_embedded = model_dict["image_embed"](images)
+    motor_embedded = model_dict["motor_embed"](motor_data)
+    future_image_embedded = model_dict["image_embed"](future_images)
+
+    # 3. 生成候选动作
+    gen_outputs = model_dict["candidate_generator"](
+        image_embedded=image_embedded,
+        motor_embedded=motor_embedded,
+        num_candidates=config.num_candidates,
+        temperature=config.temperature
+    )
+
+    # 4. 构建候选动作特征列表
+    candidate_emb_list = []
+    for candidate in gen_outputs["candidates"]:
+        candidate_emb = model_dict["motor_embed"](candidate)
+        candidate_emb = candidate_emb[:, -1, :]
+        candidate_emb_list.append(candidate_emb)
+
+    # 5. Judge Model 前向
+    judge_img_feat = model_dict["judge_image"](future_image_embedded)
+    judge_driver_feats = [model_dict["judge_driver"](emb) for emb in candidate_emb_list]
+    match_scores = model_dict["judge_total"](judge_img_feat, judge_driver_feats)
+
+    # 6. 生成Judge标签 + 计算准确率
+    # 6.1 生成标签
+    max_indices = torch.argmax(match_scores, dim=1)
+    judge_labels = torch.zeros_like(match_scores)
+    judge_labels.scatter_(1, max_indices.unsqueeze(1), 1.0)
+
+    # 6.2 计算Judge准确率：预测的最大索引 == 标签的最大索引（即模型是否选对最优候选）
+    pred_max_indices = torch.argmax(match_scores, dim=1)
+    label_max_indices = torch.argmax(judge_labels, dim=1)
+    judge_correct = (pred_max_indices == label_max_indices).sum().item()
+    judge_acc = judge_correct / batch_size
+
+    # 7. ActionExtract 前向
+    motor_pred = model_dict["action_extract"](judge_img_feat)
+
+    # 8. 损失计算
+    best_candidate = gen_outputs["candidates"][max_indices[0]]
+    gen_loss = F.mse_loss(gen_outputs["mean"], best_candidate.squeeze(1))
+    judge_loss = F.mse_loss(match_scores, judge_labels)
+    action_loss = F.mse_loss(motor_pred, real_motor_signal)
+    total_loss = gen_loss + judge_loss + action_loss
+
+    return {
+        "total_loss": total_loss,
+        "gen_loss": gen_loss,
+        "judge_loss": judge_loss,
+        "action_loss": action_loss,
+        "judge_acc": judge_acc,
+        "batch_size": batch_size
+    }
+
+
+# ======================== 5. 训练函数 ========================
 def train_one_epoch(epoch, model_dict, dataloader, optimizer):
-    """单轮训练（Judge Model 仅基于生成的候选动作训练）"""
-    # 模型设为训练模式
+    """单轮训练"""
     for model in model_dict.values():
         model.train()
 
@@ -166,117 +237,124 @@ def train_one_epoch(epoch, model_dict, dataloader, optimizer):
     gen_loss_total = 0.0
     judge_loss_total = 0.0
     action_loss_total = 0.0
+    judge_acc_total = 0.0
+    total_samples = 0
 
     for batch_idx, batch_data in enumerate(dataloader):
-        # 1. 数据预处理（移到设备）
-        images = batch_data["images"].to(config.device)  # (batch, seq, 2, 3, 64, 64)
-        motor_data = batch_data["motor_data"].to(config.device)  # (batch, seq, 2)
-        future_images = batch_data["future_images"].to(config.device)  # (batch, seq, 2, 3, 64, 64)
-        real_motor_signal = batch_data["real_motor_signal"].to(config.device)  # (batch, 2)
-
-        batch_size = images.shape[0]
         optimizer.zero_grad()
 
-        # 2. 基础特征提取
-        image_embedded = model_dict["image_embed"](images)  # (batch, seq, 256)
-        motor_embedded = model_dict["motor_embed"](motor_data)  # (batch, seq, 128)
-        future_image_embedded = model_dict["image_embed"](future_images)  # (batch, seq, 256)
+        # 计算损失和准确率
+        metrics = compute_loss_and_metrics(model_dict, batch_data)
 
-        # 3. 生成候选动作（仅生成num_candidates个，无真实动作）
-        gen_outputs = model_dict["candidate_generator"](
-            image_embedded=image_embedded,
-            motor_embedded=motor_embedded,
-            num_candidates=config.num_candidates,
-            temperature=config.temperature
-        )
-
-        # 4. 构建候选动作的电机特征列表（仅生成的动作，无真实动作）
-        candidate_emb_list = []
-        for candidate in gen_outputs["candidates"]:
-            # candidate: (batch, 1, 2) → 嵌入为 (batch, 1, 128)
-            candidate_emb = model_dict["motor_embed"](candidate)
-            candidate_emb = candidate_emb[:, -1, :]  # (batch, 128)
-            candidate_emb_list.append(candidate_emb)
-
-        # 5. Judge Model 前向（仅基于生成的候选动作）
-        # 5.1 图像特征：256维 → 32维
-        judge_img_feat = model_dict["judge_image"](future_image_embedded)  # (batch, 32)
-
-        # 5.2 电机特征：128维 → 32维
-        judge_driver_feats = []
-        for driver_emb in candidate_emb_list:
-            driver_feat_32d = model_dict["judge_driver"](driver_emb)  # (batch, 32)
-            judge_driver_feats.append(driver_feat_32d)
-
-        # 5.3 计算匹配分数：(batch, num_candidates)
-        match_scores = model_dict["judge_total"](judge_img_feat, judge_driver_feats)
-
-        # 6. 生成 Judge Model 标签（核心修改）
-        # 规则：匹配分数最大的候选标1，其余标0
-        # 6.1 找到每个样本的最大分数索引
-        max_indices = torch.argmax(match_scores, dim=1)  # (batch,)
-
-        # 6.2 构建one-hot标签（1表示最优候选，0表示其他）
-        judge_labels = torch.zeros_like(match_scores)  # (batch, num_candidates)
-        judge_labels.scatter_(1, max_indices.unsqueeze(1), 1.0)  # 最大索引位置设为1
-
-        # 7. ActionExtract 前向
-        motor_pred = model_dict["action_extract"](judge_img_feat)  # (batch, 2)
-
-        # 8. 损失计算
-        # 8.1 生成器损失：预测均值 vs 生成的最优动作（替代真实动作）
-        # 取最优候选动作作为生成器的监督信号
-        best_candidate = gen_outputs["candidates"][max_indices[0]]  # 批量第一个样本的最优候选
-        gen_loss = F.mse_loss(gen_outputs["mean"], best_candidate.squeeze(1))
-
-        # 8.2 Judge Model 损失：匹配分数 vs one-hot标签（MSE）
-        judge_loss = F.mse_loss(match_scores, judge_labels)
-
-        # 8.3 ActionExtract 损失（可选：仍用真实动作，或用最优候选）
-        action_loss = F.mse_loss(motor_pred, real_motor_signal)
-
-        # 总损失
-        total_batch_loss = gen_loss + judge_loss + action_loss
-
-        # 9. 反向传播
-        total_batch_loss.backward()
+        # 反向传播
+        metrics["total_loss"].backward()
         optimizer.step()
 
-        # 10. 损失统计
-        total_loss += total_batch_loss.item()
-        gen_loss_total += gen_loss.item()
-        judge_loss_total += judge_loss.item()
-        action_loss_total += action_loss.item()
+        # 累计指标
+        total_loss += metrics["total_loss"].item() * metrics["batch_size"]
+        gen_loss_total += metrics["gen_loss"].item() * metrics["batch_size"]
+        judge_loss_total += metrics["judge_loss"].item() * metrics["batch_size"]
+        action_loss_total += metrics["action_loss"].item() * metrics["batch_size"]
+        judge_acc_total += metrics["judge_acc"] * metrics["batch_size"]
+        total_samples += metrics["batch_size"]
 
         # 打印批次信息
         if (batch_idx + 1) % 10 == 0:
-            print(f"Epoch [{epoch + 1}/{config.epochs}] | Batch [{batch_idx + 1}/{len(dataloader)}] | "
-                  f"Total Loss: {total_batch_loss.item():.4f} | "
-                  f"Gen Loss: {gen_loss.item():.4f} | "
-                  f"Judge Loss: {judge_loss.item():.4f} | "
-                  f"Action Loss: {action_loss.item():.4f}")
+            print(f"[Train] Epoch [{epoch + 1}/{config.epochs}] | Batch [{batch_idx + 1}/{len(dataloader)}] | "
+                  f"Total Loss: {metrics['total_loss'].item():.4f} | "
+                  f"Judge Acc: {metrics['judge_acc']:.2%} | "
+                  f"Gen Loss: {metrics['gen_loss'].item():.4f} | "
+                  f"Judge Loss: {metrics['judge_loss'].item():.4f}")
 
-    # 计算平均损失
-    avg_total_loss = total_loss / len(dataloader)
-    avg_gen_loss = gen_loss_total / len(dataloader)
-    avg_judge_loss = judge_loss_total / len(dataloader)
-    avg_action_loss = action_loss_total / len(dataloader)
+    # 计算平均指标
+    avg_total_loss = total_loss / total_samples
+    avg_gen_loss = gen_loss_total / total_samples
+    avg_judge_loss = judge_loss_total / total_samples
+    avg_action_loss = action_loss_total / total_samples
+    avg_judge_acc = judge_acc_total / total_samples
 
-    return avg_total_loss, avg_gen_loss, avg_judge_loss, avg_action_loss
+    return {
+        "total_loss": avg_total_loss,
+        "gen_loss": avg_gen_loss,
+        "judge_loss": avg_judge_loss,
+        "action_loss": avg_action_loss,
+        "judge_acc": avg_judge_acc
+    }
 
 
-# ======================== 5. 主训练流程 ========================
+# ======================== 6. 验证函数（新增） ========================
+def validate_one_epoch(epoch, model_dict, dataloader):
+    """单轮验证（无反向传播）"""
+    for model in model_dict.values():
+        model.eval()  # 评估模式：关闭dropout/batchnorm
+
+    total_loss = 0.0
+    gen_loss_total = 0.0
+    judge_loss_total = 0.0
+    action_loss_total = 0.0
+    judge_acc_total = 0.0
+    total_samples = 0
+
+    with torch.no_grad():  # 禁用梯度计算，节省显存
+        for batch_idx, batch_data in enumerate(dataloader):
+            # 计算损失和准确率
+            metrics = compute_loss_and_metrics(model_dict, batch_data)
+
+            # 累计指标
+            total_loss += metrics["total_loss"].item() * metrics["batch_size"]
+            gen_loss_total += metrics["gen_loss"].item() * metrics["batch_size"]
+            judge_loss_total += metrics["judge_loss"].item() * metrics["batch_size"]
+            action_loss_total += metrics["action_loss"].item() * metrics["batch_size"]
+            judge_acc_total += metrics["judge_acc"] * metrics["batch_size"]
+            total_samples += metrics["batch_size"]
+
+            # 打印批次信息
+            if (batch_idx + 1) % 10 == 0:
+                print(f"[Val] Epoch [{epoch + 1}/{config.epochs}] | Batch [{batch_idx + 1}/{len(dataloader)}] | "
+                      f"Total Loss: {metrics['total_loss'].item():.4f} | "
+                      f"Judge Acc: {metrics['judge_acc']:.2%}")
+
+    # 计算平均指标
+    avg_total_loss = total_loss / total_samples
+    avg_gen_loss = gen_loss_total / total_samples
+    avg_judge_loss = judge_loss_total / total_samples
+    avg_action_loss = action_loss_total / total_samples
+    avg_judge_acc = judge_acc_total / total_samples
+
+    return {
+        "total_loss": avg_total_loss,
+        "gen_loss": avg_gen_loss,
+        "judge_loss": avg_judge_loss,
+        "action_loss": avg_action_loss,
+        "judge_acc": avg_judge_acc
+    }
+
+
+# ======================== 7. 主训练流程（含验证） ========================
 def main():
     # 1. 初始化模型
     model_dict = init_models()
 
-    # 2. 构建数据集
-    train_dataset = PretrainDataset(num_samples=1000)
+    # 2. 构建数据集（训练+验证）
+    total_samples = 1000
+    val_samples = int(total_samples * config.val_split)
+    train_samples = total_samples - val_samples
+
+    train_dataset = PretrainDataset(num_samples=train_samples, is_train=True)
+    val_dataset = PretrainDataset(num_samples=val_samples, is_train=False)
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=0  # 根据硬件调整
+        num_workers=0
+    )
+
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,  # 验证集不打乱
+        num_workers=0
     )
 
     # 3. 优化器
@@ -290,48 +368,69 @@ def main():
         weight_decay=config.weight_decay
     )
 
-    # 4. 训练循环
-    best_loss = float("inf")
+    # 4. 训练+验证循环
+    best_val_acc = 0.0  # 保存最佳验证准确率
+    best_val_loss = float("inf")
+
     for epoch in range(config.epochs):
         start_time = time.time()
 
-        # 单轮训练
-        train_total, train_gen, train_judge, train_action = train_one_epoch(
-            epoch, model_dict, train_dataloader, optimizer
-        )
+        # 训练
+        train_metrics = train_one_epoch(epoch, model_dict, train_dataloader, optimizer)
 
-        # 打印epoch信息
+        # 验证
+        val_metrics = validate_one_epoch(epoch, model_dict, val_dataloader)
+
+        # 计算耗时
         epoch_time = time.time() - start_time
-        print(f"\nEpoch [{epoch + 1}/{config.epochs}] | Time: {epoch_time:.2f}s | "
-              f"Avg Total Loss: {train_total:.4f} | "
-              f"Avg Gen Loss: {train_gen:.4f} | "
-              f"Avg Judge Loss: {train_judge:.4f} | "
-              f"Avg Action Loss: {train_action:.4f}")
 
-        # 保存最佳模型
-        if train_total < best_loss:
-            best_loss = train_total
+        # 打印Epoch汇总
+        print("\n" + "=" * 80)
+        print(f"Epoch [{epoch + 1}/{config.epochs}] | Time: {epoch_time:.2f}s")
+        print("-" * 40 + " 训练集 " + "-" * 40)
+        print(f"Total Loss: {train_metrics['total_loss']:.4f} | "
+              f"Gen Loss: {train_metrics['gen_loss']:.4f} | "
+              f"Judge Loss: {train_metrics['judge_loss']:.4f} | "
+              f"Action Loss: {train_metrics['action_loss']:.4f} | "
+              f"Judge Acc: {train_metrics['judge_acc']:.2%}")
+        print("-" * 40 + " 验证集 " + "-" * 40)
+        print(f"Total Loss: {val_metrics['total_loss']:.4f} | "
+              f"Gen Loss: {val_metrics['gen_loss']:.4f} | "
+              f"Judge Loss: {val_metrics['judge_loss']:.4f} | "
+              f"Action Loss: {val_metrics['action_loss']:.4f} | "
+              f"Judge Acc: {val_metrics['judge_acc']:.2%}")
+        print("=" * 80 + "\n")
+
+        # 保存最佳模型（基于验证准确率）
+        if val_metrics["judge_acc"] > best_val_acc:
+            best_val_acc = val_metrics["judge_acc"]
+            best_val_loss = val_metrics["total_loss"]
             os.makedirs("./checkpoints", exist_ok=True)
             torch.save({
                 "epoch": epoch,
                 "model_dict": {k: v.state_dict() for k, v in model_dict.items()},
                 "optimizer_dict": optimizer.state_dict(),
-                "best_loss": best_loss
+                "best_val_acc": best_val_acc,
+                "best_val_loss": best_val_loss
             }, "./checkpoints/best_model.pth")
-            print(f"保存最佳模型，当前最佳损失：{best_loss:.4f}")
+            print(f"保存最佳模型！当前最佳验证Judge Acc: {best_val_acc:.2%} | Val Loss: {best_val_loss:.4f}\n")
 
-        # 定期保存
+        # 定期保存模型
         if (epoch + 1) % config.save_interval == 0:
             torch.save({
                 "epoch": epoch,
                 "model_dict": {k: v.state_dict() for k, v in model_dict.items()},
-                "optimizer_dict": optimizer.state_dict()
+                "optimizer_dict": optimizer.state_dict(),
+                "val_acc": val_metrics["judge_acc"],
+                "val_loss": val_metrics["total_loss"]
             }, f"./checkpoints/epoch_{epoch + 1}.pth")
-            print(f"保存Epoch {epoch + 1} 模型")
+            print(f"保存Epoch {epoch + 1} 模型\n")
 
-    print("\n训练完成！最佳模型已保存至 ./checkpoints/best_model.pth")
+    print(f"训练完成！")
+    print(f"最佳验证Judge准确率：{best_val_acc:.2%} | 最佳验证损失：{best_val_loss:.4f}")
+    print(f"最佳模型路径：./checkpoints/best_model.pth")
 
 
-# ======================== 6. 入口函数 ========================
+# ======================== 8. 入口函数 ========================
 if __name__ == "__main__":
     main()
