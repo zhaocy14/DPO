@@ -133,8 +133,8 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         # x形状：(batch, seq_len, d_model)
         seq_length = x.size(1)
-        # 取对应长度的位置编码并重复到batch维度
-        pe = self.pe[:, :seq_length, :].repeat(x.size(0), 1, 1)
+        # 取对应长度的位置编码（无需repeat，广播机制自动匹配batch）
+        pe = self.pe[:, :seq_length, :]
         x = x + pe  # 位置编码与输入相加
         return x
 
@@ -296,11 +296,11 @@ class SimilarityModelDriver(nn.Module):
 
 class JudgeModelImage(nn.Module):
     """基于图像序列嵌入的判断模型（输出图像序列的评分/判断结果）"""
-    def __init__(self, embed_dim=128, num_frames=30, num_layers=3, nhead=4, judge_dim=1):
+    def __init__(self, embed_dim=128, num_frames=30, num_layers=3, nhead=4, judge_dim=32):
         super(JudgeModelImage, self).__init__()
-        self.input_dim = embed_dim * 2  # 双摄像头图像嵌入维度（2*embed_dim）
+        self.input_dim = embed_dim * 2  # 双摄像头图像嵌入维度（2*embed_dim=256）
         self.num_frames = num_frames
-        self.judge_dim = judge_dim  # 判断输出维度（默认1维评分）
+        self.judge_dim = judge_dim  # 匹配训练配置的32维
         self.positional_encoding = PositionalEncoding(self.input_dim, max_len=num_frames)
 
         # Transformer编码器提取时序特征
@@ -314,87 +314,85 @@ class JudgeModelImage(nn.Module):
             num_layers=num_layers
         )
 
-        # 评分预测全连接层
+        # 评分预测全连接层（新增投影层，将256维→32维）
         self.fc_judge = nn.Sequential(
-            nn.Linear(self.input_dim, self.input_dim // 2),
+            nn.Linear(self.input_dim, self.input_dim // 2),  # 256→128
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(self.input_dim // 2, self.judge_dim),
-            nn.Sigmoid()  # 输出归一化到[0,1]（评分/概率）
+            nn.Linear(self.input_dim // 2, self.judge_dim),  # 128→32
+            nn.Sigmoid()  # 输出归一化到[0,1]
         )
 
     def forward(self, imgs_embedding):
         """
-        输入：imgs_embedding → (batch, num_frames, 2*embed_dim)（双摄像头连续帧嵌入）
-        输出：judge_score → (batch, judge_dim)（图像序列的判断分数）
+        输入：imgs_embedding → (batch, num_frames, 2*embed_dim)（256维图像嵌入）
+        输出：judge_score → (batch, judge_dim)（32维判断分数）
         """
-        # 加入位置编码
+        # 加入位置编码（维度256，匹配输入）
         imgs_embedding_pe = self.positional_encoding(imgs_embedding)
         # Transformer编码时序特征
-        transformer_out = self.transformer_encoder(imgs_embedding_pe)  # (batch, num_frames, 2*embed_dim)
+        transformer_out = self.transformer_encoder(imgs_embedding_pe)  # (batch, 30, 256)
         # 取最后一帧特征作为全局表示
-        final_feat = transformer_out[:, -1, :]  # (batch, 2*embed_dim)
-        # 预测判断分数
-        judge_score = self.fc_judge(final_feat)
+        final_feat = transformer_out[:, -1, :]  # (batch, 256)
+        # 投影到32维判断空间
+        judge_score = self.fc_judge(final_feat)  # (batch, 32)
         return judge_score
 
 
 class JudgeModelDriver(nn.Module):
     """基于电机动作嵌入的判断模型（输出电机动作的评分/判断结果）"""
-    def __init__(self, embed_dim=64, judge_dim=1):
+    def __init__(self, embed_dim=128, judge_dim=32):
         super(JudgeModelDriver, self).__init__()
-        self.judge_dim = judge_dim  # 判断输出维度（默认1维评分）
-        # 评分预测全连接层
+        self.judge_dim = judge_dim  # 匹配训练配置的32维
+        # 评分预测全连接层（将128维电机嵌入→32维判断空间）
         self.fc_judge = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 2),
+            nn.Linear(embed_dim, embed_dim // 2),  # 128→64
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(embed_dim // 2, self.judge_dim),
-            nn.Sigmoid()  # 输出归一化到[0,1]（评分/概率）
+            nn.Linear(embed_dim // 2, self.judge_dim),  # 64→32
+            nn.Sigmoid()  # 输出归一化到[0,1]
         )
 
     def forward(self, driver_embedding):
         """
-        输入：driver_embedding → (batch, embed_dim)（单帧电机动作嵌入）
-        输出：judge_score → (batch, judge_dim)（电机动作的判断分数）
+        输入：driver_embedding → (batch, embed_dim)（128维电机嵌入）
+        输出：judge_score → (batch, judge_dim)（32维判断分数）
         """
-        judge_score = self.fc_judge(driver_embedding)
+        judge_score = self.fc_judge(driver_embedding)  # (batch, 32)
         return judge_score
 
 
 class JudgeModel(nn.Module):
-    """整合图像和电机判断结果的总判断模型"""
-    def __init__(self, embed_dim=128, num_frames=30, num_layers=3, nhead=4, judge_dim=1):
+    """重构：融合单张图像特征和多个电机特征，输出匹配分数（适配训练代码调用）"""
+    def __init__(self, embed_dim=128, num_frames=30, num_layers=3, nhead=4, judge_dim=32):
         super(JudgeModel, self).__init__()
         self.judge_dim = judge_dim
-        # 子判断模型
-        self.judge_image = JudgeModelImage(embed_dim, num_frames, num_layers, nhead, judge_dim)
-        self.judge_driver = JudgeModelDriver(embed_dim, judge_dim)
-        # 融合层（融合图像和电机的判断分数）
+        # 融合层：计算图像特征与每个电机特征的匹配分数
         self.fc_fusion = nn.Sequential(
-            nn.Linear(judge_dim * 2, judge_dim),
+            nn.Linear(judge_dim * 2, judge_dim),  # 32*2=64 → 32
             nn.ReLU(),
-            nn.Linear(judge_dim, judge_dim),
+            nn.Linear(judge_dim, 1),  # 32 → 1（单维度匹配分数）
             nn.Sigmoid()
         )
 
-    def forward(self, imgs_embedding, driver_embedding):
+    def forward(self, img_judge_feat, driver_judge_feats):
         """
         输入：
-            imgs_embedding → (batch, num_frames, 2*embed_dim)（图像序列嵌入）
-            driver_embedding → (batch, embed_dim)（单帧电机动作嵌入）
+            img_judge_feat: (batch, judge_dim) → JudgeModelImage的输出（32维）
+            driver_judge_feats: list → 多个JudgeModelDriver的输出，每个元素是(batch, judge_dim)
         输出：
-            final_score → (batch, judge_dim)（最终融合判断分数）
-            img_score → (batch, judge_dim)（图像单独判断分数）
-            driver_score → (batch, judge_dim)（电机单独判断分数）
+            match_scores: (batch, num_candidates+1) → 每个电机动作与图像的匹配分数
         """
-        # 分别计算图像和电机的判断分数
-        img_score = self.judge_image(imgs_embedding)
-        driver_score = self.judge_driver(driver_embedding)
-        # 融合分数
-        fusion_feat = torch.cat([img_score, driver_score], dim=-1)
-        final_score = self.fc_fusion(fusion_feat)
-        return final_score, img_score, driver_score
+        match_scores = []
+        for driver_feat in driver_judge_feats:
+            # 拼接图像特征和单个电机特征
+            fusion_feat = torch.cat([img_judge_feat, driver_feat], dim=-1)  # (batch, 64)
+            # 计算匹配分数
+            score = self.fc_fusion(fusion_feat)  # (batch, 1)
+            match_scores.append(score)
+        # 拼接所有分数 → (batch, num_candidates+1)
+        match_scores = torch.cat(match_scores, dim=-1)
+        return match_scores
 
 
 class ActionExtract(nn.Module):
@@ -403,30 +401,30 @@ class ActionExtract(nn.Module):
     输入：JudgeModelImage的输出 (batch, judge_dim)
     输出：电机信号预测 (batch, motor_dim)，可与真实电机信号计算损失
     """
-    def __init__(self, in_dim=1, hidden_dim=64, out_dim=2, dropout_rate=0.2):
+    def __init__(self, in_dim=32, hidden_dim=64, out_dim=2, dropout_rate=0.2):
         super(ActionExtract, self).__init__()
-        # 3层全连接结构（严格3层FC，中间加ReLU+Dropout）
+        # 修正输入维度为32（匹配JudgeModelImage的输出）
         self.fc_layers = nn.Sequential(
-            # 第1层全连接
+            # 第1层全连接（32→64）
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            # 第2层全连接
+            # 第2层全连接（64→64）
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            # 第3层全连接（输出层，无激活，直接输出电机信号）
+            # 第3层全连接（64→2）
             nn.Linear(hidden_dim, out_dim)
         )
 
     def forward(self, judge_image_output):
         """
         前向传播：输入JudgeModelImage的输出，输出电机信号预测
-        :param judge_image_output: (batch, judge_dim) → JudgeModelImage的输出
+        :param judge_image_output: (batch, judge_dim) → JudgeModelImage的输出（32维）
         :return: motor_pred: (batch, motor_dim) → 预测的电机信号
         """
         motor_pred = self.fc_layers(judge_image_output)
-        # 可选：限制电机信号范围（如tanh归一化到[-1,1]，与真实电机信号对齐）
+        # 限制电机信号范围到[-1,1]
         motor_pred = torch.tanh(motor_pred)
         return motor_pred
 
@@ -452,7 +450,7 @@ if __name__ == "__main__":
     motor_dim = 2  # 两个电机（动作维度=2）
     embed_dim = 128  # 嵌入维度
     num_candidates = 5  # 生成候选动作数量
-    judge_dim = 1  # JudgeModelImage输出维度（评分）
+    judge_dim = 32  # JudgeModelImage输出维度（适配训练配置）
     action_extract_hidden = 64  # ActionExtract隐藏层维度
 
     # 2. 初始化模型
@@ -536,9 +534,9 @@ if __name__ == "__main__":
     # 4.4 判断模型前向（验证新增类功能）
     img_judge_score = judge_image_model(future_image_embedded)  # (batch, judge_dim)
     driver_judge_score = judge_driver_model(last_motor_embedded)  # (batch, judge_dim)
-    final_judge_score, img_score, driver_score = judge_total_model(
-        future_image_embedded, last_motor_embedded
-    )
+    # 模拟多个电机特征列表（适配重构后的JudgeModel）
+    judge_driver_feats = [driver_judge_score for _ in range(num_candidates+1)]
+    match_scores = judge_total_model(img_judge_score, judge_driver_feats)  # (batch, num_candidates+1)
 
     # 4.5 ActionExtract前向（验证新增类）
     motor_pred = action_extract_model(img_judge_score)  # (batch, motor_dim)
@@ -561,10 +559,9 @@ if __name__ == "__main__":
     print("\n3. 判断模型输出检查（新增类验证）")
     print(f"   - 图像单独判断分数形状：{img_judge_score.shape}（应是(batch,{judge_dim})）")
     print(f"   - 电机单独判断分数形状：{driver_judge_score.shape}（应是(batch,{judge_dim})）")
-    print(f"   - 融合判断分数形状：{final_judge_score.shape}（应是(batch,{judge_dim})）")
-    print(f"   - 图像判断分数：{img_judge_score.squeeze().item():.4f}（归一化到[0,1]）")
-    print(f"   - 电机判断分数：{driver_judge_score.squeeze().item():.4f}（归一化到[0,1]）")
-    print(f"   - 最终融合分数：{final_judge_score.squeeze().item():.4f}（归一化到[0,1]）")
+    print(f"   - 匹配分数形状：{match_scores.shape}（应是(batch,{num_candidates+1})）")
+    print(f"   - 图像判断分数：{img_judge_score.squeeze()[0].item():.4f}（归一化到[0,1]）")
+    print(f"   - 电机判断分数：{driver_judge_score.squeeze()[0].item():.4f}（归一化到[0,1]）")
 
     print("\n4. ActionExtract输出检查（新增类验证）")
     print(f"   - JudgeModelImage输出形状：{img_judge_score.shape}")
