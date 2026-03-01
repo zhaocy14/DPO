@@ -41,10 +41,10 @@ config = {
     "nhead_gen": 8,
     "num_layers_gen": 16,
     "motor_dim": 2,  # 两个电机，动作维度为2
-    "gen_seq_len": 30,  # 观测序列长度
+    "gen_seq_len": 15,  # 观测序列长度
 
     # 相似度模型参数
-    "sim_seq_len": 30,  # 预测序列长度
+    "sim_seq_len": 15,  # 预测序列长度
     "embed_dim_sim": 128,
     "num_layers_sim": 3,
     "nhead_sim": 4,
