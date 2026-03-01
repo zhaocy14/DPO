@@ -179,12 +179,13 @@ class EncoderOnlyCandidateGenerator(nn.Module):
     输出：(batch, motor_dim=2) 的均值/标准差 + 多个候选动作
     """
 
-    def __init__(self, embed_dim, nhead, num_layers, motor_dim=2, max_seq_length=100):
+    def __init__(self, embed_dim, nhead, num_layers, motor_dim=2, max_seq_length=100, temperature=2.0):
         super().__init__()
         self.d_model = embed_dim * 3  # motor_embed(1*dim) + image_embed(2*dim)
         self.motor_dim = motor_dim  # 固定为2（两个电机）
         self.positional_encoding = PositionalEncoding(self.d_model, max_seq_length)
         self.encoder = TransformerEncoderModel(embed_dim, nhead, num_layers)
+        self.temperature = temperature
 
         # 【核心修改】只保留一组分布参数输出层（删除mean2/std2相关）
         self.fc_mean = nn.Linear(self.d_model, motor_dim)  # 动作均值预测（2维）
@@ -213,7 +214,7 @@ class EncoderOnlyCandidateGenerator(nn.Module):
 
         # 限制对数方差范围，避免标准差过大/过小
         logvar = torch.clamp(logvar, min=-5, max=5)
-        std = torch.exp(0.5 * logvar) * temperature  # 标准差（温度调整随机性）
+        std = torch.exp(0.5 * logvar) * self.temperature  # 标准差（温度调整随机性）
 
         # 4. 生成多个候选动作（从高斯分布采样）
         candidates = []
