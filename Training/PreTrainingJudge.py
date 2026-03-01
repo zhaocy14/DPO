@@ -266,7 +266,7 @@ def compute_loss_and_metrics(batch):
     # 8. 损失计算（核心调整）
     gen_loss = nll_loss(mean, std, next_driver)  # 生成器损失
     judge_loss = judge_ce_loss(match_scores, gen_best_indices)  # Judge交叉熵损失（分类）
-    action_loss = action_extract_mse_loss(pred_action_seq, true_action_seq)  # ActionExtract的MSE损失
+    action_loss = -action_extract_mse_loss(pred_action_seq, true_action_seq)  # ActionExtract的MSE损失
     # 总损失：平衡三个损失，约束judge_image_model不受动作序列干扰
     total_loss = gen_loss + 1.0 * judge_loss + 0.0 * action_loss
 

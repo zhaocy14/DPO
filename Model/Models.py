@@ -363,16 +363,37 @@ class JudgeModelDriver(nn.Module):
 
 
 class JudgeModel(nn.Module):
-    """重构：融合单张图像特征和多个电机特征，输出匹配分数（适配训练代码调用）"""
+    """重构：用三层TransformerEncoder替代单步注意力，增强特征融合能力"""
+
     def __init__(self, embed_dim=128, num_frames=30, num_layers=3, nhead=4, judge_dim=32):
         super(JudgeModel, self).__init__()
         self.judge_dim = judge_dim
-        # 融合层：计算图像特征与每个电机特征的匹配分数
+
+        # 1. 特征投影层：将图像+动作的拼接特征投影到Transformer输入维度
+        self.projection = nn.Linear(judge_dim * 2, judge_dim)
+
+        # 2. 三层TransformerEncoder（核心修改）
+        # 定义Encoder层的基础配置
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=judge_dim,  # 输入特征维度（和judge_dim对齐）
+            nhead=nhead,  # 注意力头数（保持4头）
+            dim_feedforward=judge_dim * 4,  # 前馈网络维度（4倍judge_dim，提升表达）
+            dropout=0.1,  # dropout防止过拟合
+            activation='relu',  # 激活函数
+            batch_first=True  # 输入格式为(batch, seq_len, feature)
+        )
+        # 堆叠三层Encoder
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers  # 明确设置三层（和参数num_layers对齐）
+        )
+
+        # 3. 融合输出层：将Transformer输出转为匹配分数
         self.fc_fusion = nn.Sequential(
-            nn.Linear(judge_dim * 2, judge_dim),  # 32*2=64 → 32
+            nn.Linear(judge_dim, judge_dim * 2),
             nn.ReLU(),
-            nn.Linear(judge_dim, 1),  # 32 → 1（单维度匹配分数）
-            nn.Sigmoid()
+            nn.Dropout(0.1),
+            nn.Linear(judge_dim * 2, 1)  # 无Sigmoid，保留原始分数供交叉熵优化
         )
 
     def forward(self, img_judge_feat, driver_judge_feats):
@@ -381,16 +402,35 @@ class JudgeModel(nn.Module):
             img_judge_feat: (batch, judge_dim) → JudgeModelImage的输出（32维）
             driver_judge_feats: list → 多个JudgeModelDriver的输出，每个元素是(batch, judge_dim)
         输出：
-            match_scores: (batch, num_candidates+1) → 每个电机动作与图像的匹配分数
+            match_scores: (batch, num_candidates) → 每个电机动作与图像的匹配分数
         """
         match_scores = []
+
+        # 遍历每个候选动作的电机特征
         for driver_feat in driver_judge_feats:
-            # 拼接图像特征和单个电机特征
-            fusion_feat = torch.cat([img_judge_feat, driver_feat], dim=-1)  # (batch, 64)
-            # 计算匹配分数
-            score = self.fc_fusion(fusion_feat)  # (batch, 1)
+            # Step 1: 拼接图像特征和单个动作特征 → (batch, 64)
+            fusion_feat = torch.cat([img_judge_feat, driver_feat], dim=-1)
+
+            # Step 2: 投影到Transformer输入维度 → (batch, 64) → (batch, 32)
+            proj_feat = self.projection(fusion_feat)
+
+            # Step 3: 增加序列维度（Transformer要求seq_len维度）→ (batch, 1, 32)
+            seq_feat = proj_feat.unsqueeze(1)
+
+            # Step 4: 三层TransformerEncoder编码 → (batch, 1, 32)
+            # 注：即使seq_len=1，TransformerEncoder仍能通过多层注意力捕捉特征关联
+            encoder_feat = self.transformer_encoder(seq_feat)
+
+            # Step 5: 压缩序列维度 → (batch, 32)
+            encoder_feat = encoder_feat.squeeze(1)
+
+            # Step 6: 计算当前候选的匹配分数 → (batch, 1)
+            score = self.fc_fusion(encoder_feat)
+
+            # 收集分数
             match_scores.append(score)
-        # 拼接所有分数 → (batch, num_candidates+1)
+
+        # Step 7: 拼接所有候选的分数 → (batch, num_candidates)
         match_scores = torch.cat(match_scores, dim=-1)
         return match_scores
 
