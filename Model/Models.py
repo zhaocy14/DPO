@@ -8,7 +8,7 @@ from torchvision.models import resnet18
 from torchvision.models import ResNet18_Weights
 
 # 路径配置（确保导入正常）
-pwd = os.path.abspath(os.path.abspath(__file__))
+pwd = os.path.abspath(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
 father_path = os.path.abspath(os.path.dirname(pwd) + os.path.sep + "..")
 sys.path.append(father_path)
 
@@ -233,12 +233,18 @@ class EncoderOnlyCandidateGenerator(nn.Module):
 
 
 class SimilarityModelImage(nn.Module):
-    """处理连续帧图像嵌入的投射模型（输入已拼接双摄像头特征）"""
+    """处理连续帧图像嵌入的投射模型（输入已拼接双摄像头特征）
+    修改后新增：
+    - 电机动作预测分支，三层全连接，输出维度与MotorEmbedding输入维度一致
+    - forward返回：(相似度投射特征, 电机动作预测)
+    """
 
-    def __init__(self, embed_dim=128, num_frames=30, num_layers=3, nhead=4, similarity_dim=128):
+    def __init__(self, embed_dim=128, num_frames=30, num_layers=3, nhead=4,
+                 similarity_dim=128, motor_dim=2, dropout_rate=0.2):
         super(SimilarityModelImage, self).__init__()
         self.input_dim = embed_dim * 2  # 双摄像头图像嵌入维度（2*embed_dim）
         self.num_frames = num_frames
+        self.motor_dim = motor_dim  # 电机动作维度（与MotorEmbedding输入一致）
         self.positional_encoding = PositionalEncoding(self.input_dim, max_len=num_frames)
 
         # Transformer编码器（提取时序特征）
@@ -252,17 +258,33 @@ class SimilarityModelImage(nn.Module):
             num_layers=num_layers
         )
 
-        # 全连接层（映射到相似度空间）
-        self.fc = nn.Sequential(
+        # 分支1：相似度投射（原有功能）
+        self.fc_similarity = nn.Sequential(
             nn.Linear(self.input_dim, self.input_dim // 2),
             nn.ReLU(),
             nn.Linear(self.input_dim // 2, similarity_dim)
         )
 
+        # 分支2：电机动作预测（新增，三层全连接，结构同ActionExtract）
+        self.fc_motor = nn.Sequential(
+            # 第1层：输入维度=input_dim → 隐藏层维度=input_dim//2
+            nn.Linear(self.input_dim, self.input_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            # 第2层：隐藏层→隐藏层
+            nn.Linear(self.input_dim // 2, self.input_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            # 输出层：隐藏层→电机动作维度
+            nn.Linear(self.input_dim // 2, self.motor_dim)
+        )
+
     def forward(self, imgs_embedding):
         """
         输入：imgs_embedding → (batch, num_frames, 2*embed_dim)（双摄像头连续帧嵌入）
-        输出：image_proj → (batch, similarity_dim)（投射到相似度空间的特征）
+        输出：
+            image_proj → (batch, similarity_dim)（投射到相似度空间的特征）
+            motor_pred → (batch, motor_dim)（预测的电机动作，范围[-1,1]）
         """
         # 加入位置编码
         imgs_embedding_pe = self.positional_encoding(imgs_embedding)
@@ -270,8 +292,15 @@ class SimilarityModelImage(nn.Module):
         transformer_out = self.transformer_encoder(imgs_embedding_pe)  # (batch, num_frames, 2*embed_dim)
         # 取最后一帧特征作为全局表示
         final_feat = transformer_out[:, -1, :]  # (batch, 2*embed_dim)
-        # 投射到相似度空间
-        return self.fc(final_feat)
+
+        # 分支1：相似度投射（原有输出）
+        image_proj = self.fc_similarity(final_feat)
+
+        # 分支2：电机动作预测（新增输出）
+        motor_pred = self.fc_motor(final_feat)
+        motor_pred = torch.tanh(motor_pred)  # 限制动作范围到[-1,1]
+
+        return image_proj, motor_pred
 
 
 class SimilarityModelDriver(nn.Module):
@@ -296,6 +325,7 @@ class SimilarityModelDriver(nn.Module):
 
 class JudgeModelImage(nn.Module):
     """基于图像序列嵌入的判断模型（输出图像序列的评分/判断结果）"""
+
     def __init__(self, embed_dim=128, num_frames=30, num_layers=3, nhead=4, judge_dim=32):
         super(JudgeModelImage, self).__init__()
         self.input_dim = embed_dim * 2  # 双摄像头图像嵌入维度（2*embed_dim=256）
@@ -341,6 +371,7 @@ class JudgeModelImage(nn.Module):
 
 class JudgeModelDriver(nn.Module):
     """基于电机动作嵌入的判断模型（输出电机动作的评分/判断结果）"""
+
     def __init__(self, embed_dim=128, judge_dim=32):
         super(JudgeModelDriver, self).__init__()
         self.judge_dim = judge_dim  # 匹配训练配置的32维
@@ -441,6 +472,7 @@ class ActionExtract(nn.Module):
     输入：JudgeModelImage的输出 (batch, judge_dim)
     输出：电机信号预测 (batch, motor_dim)，可与真实电机信号计算损失
     """
+
     def __init__(self, in_dim=32, hidden_dim=64, out_dim=2, dropout_rate=0.2):
         super(ActionExtract, self).__init__()
         # 修正输入维度为32（匹配JudgeModelImage的输出）
@@ -481,7 +513,7 @@ def calculate_model_size(model):
 
 
 # ------------------------------
-# 示例使用（验证新增ActionExtract类功能）
+# 示例使用（验证修改后功能）
 # ------------------------------
 if __name__ == "__main__":
     # 1. 配置参数
@@ -508,7 +540,9 @@ if __name__ == "__main__":
         num_frames=seq_length,
         num_layers=2,
         nhead=4,
-        similarity_dim=32
+        similarity_dim=32,
+        motor_dim=motor_dim,  # 指定电机动作维度
+        dropout_rate=0.2
     )
     driver_sim_model = SimilarityModelDriver(
         embed_dim=embed_dim,
@@ -533,7 +567,7 @@ if __name__ == "__main__":
         nhead=4,
         judge_dim=judge_dim
     )
-    # 初始化新增的ActionExtract模型
+    # 初始化ActionExtract模型
     action_extract_model = ActionExtract(
         in_dim=judge_dim,  # 输入维度=JudgeModelImage输出维度
         hidden_dim=action_extract_hidden,
@@ -567,21 +601,23 @@ if __name__ == "__main__":
         temperature=0.5
     )
 
-    # 4.3 相似度模型前向（验证维度匹配）
-    img_proj = img_sim_model(future_image_embedded)  # (batch, 32)
+    # 4.3 相似度模型前向（适配新的双输出）
+    img_proj, img_motor_pred = img_sim_model(future_image_embedded)  # 新增接收电机预测输出
     driver_proj = driver_sim_model(last_motor_embedded)  # (batch, 32)
 
     # 4.4 判断模型前向（验证新增类功能）
     img_judge_score = judge_image_model(future_image_embedded)  # (batch, judge_dim)
     driver_judge_score = judge_driver_model(last_motor_embedded)  # (batch, judge_dim)
     # 模拟多个电机特征列表（适配重构后的JudgeModel）
-    judge_driver_feats = [driver_judge_score for _ in range(num_candidates+1)]
+    judge_driver_feats = [driver_judge_score for _ in range(num_candidates + 1)]
     match_scores = judge_total_model(img_judge_score, judge_driver_feats)  # (batch, num_candidates+1)
 
     # 4.5 ActionExtract前向（验证新增类）
     motor_pred = action_extract_model(img_judge_score)  # (batch, motor_dim)
     # 计算预测电机信号与真实信号的MSE损失（示例）
     mse_loss = F.mse_loss(motor_pred, real_motor_signal)
+    # 计算SimilarityModelImage预测电机信号的MSE损失
+    img_motor_mse_loss = F.mse_loss(img_motor_pred, real_motor_signal)
 
     # 5. 打印结果（验证修改正确性）
     print("=" * 60)
@@ -591,15 +627,18 @@ if __name__ == "__main__":
     print(f"   - 动作均值形状：{gen_outputs['mean'].shape}（应是(batch,2)）")
     print(f"   - 动作标准差形状：{gen_outputs['std'].shape}（应是(batch,2)）")
 
-    print("\n2. 相似度模型输出检查")
+    print("\n2. 相似度模型输出检查（新增电机预测分支）")
     print(f"   - 图像投射特征形状：{img_proj.shape}（应是(batch,32)）")
+    print(f"   - 图像预测电机动作形状：{img_motor_pred.shape}（应是(batch,{motor_dim})）")
     print(f"   - 电机投射特征形状：{driver_proj.shape}（应是(batch,32)）")
     print(f"   - 余弦相似度：{F.cosine_similarity(img_proj, driver_proj, dim=1).tolist()}")
+    print(f"   - 图像预测电机动作值：{img_motor_pred.squeeze().tolist()}（归一化到[-1,1]）")
+    print(f"   - 图像预测电机动作MSE损失：{img_motor_mse_loss.item():.4f}")
 
     print("\n3. 判断模型输出检查（新增类验证）")
     print(f"   - 图像单独判断分数形状：{img_judge_score.shape}（应是(batch,{judge_dim})）")
     print(f"   - 电机单独判断分数形状：{driver_judge_score.shape}（应是(batch,{judge_dim})）")
-    print(f"   - 匹配分数形状：{match_scores.shape}（应是(batch,{num_candidates+1})）")
+    print(f"   - 匹配分数形状：{match_scores.shape}（应是(batch,{num_candidates + 1})）")
     print(f"   - 图像判断分数：{img_judge_score.squeeze()[0].item():.4f}（归一化到[0,1]）")
     print(f"   - 电机判断分数：{driver_judge_score.squeeze()[0].item():.4f}（归一化到[0,1]）")
 

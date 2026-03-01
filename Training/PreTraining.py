@@ -34,6 +34,7 @@ config = {
     "epochs": 100,
     "lr": 1e-5,
     "sampling_workers": 20,
+    "reverse_mse_weight": 1.0,  # 新增：反向MSE损失权重
 
     # 生成器模型参数
     "embed_dim_gen": 128,
@@ -79,12 +80,15 @@ candidate_generator = EncoderOnlyCandidateGenerator(
     max_seq_length=config["gen_seq_len"]
 ).to(device)
 
+# 【修改1】初始化img_sim_model时补充motor_dim参数（适配修改后的模型）
 img_sim_model = SimilarityModelImage(
     embed_dim=config['embed_dim_sim'],
     num_frames=config['sim_seq_len'],
     num_layers=config['num_layers_sim'],
     nhead=config['nhead_sim'],
-    similarity_dim=config['similarity_dim']
+    similarity_dim=config['similarity_dim'],
+    motor_dim=config['motor_dim'],  # 新增：指定电机维度
+    dropout_rate=0.2  # 新增：dropout参数（与模型定义一致）
 ).to(device)
 
 driver_sim_model = SimilarityModelDriver(
@@ -182,6 +186,22 @@ def info_ce_loss(img_proj, candidate_projections, temperature=0.1):
     return loss
 
 
+# 【新增】定义反向MSE损失函数
+def reverse_mse_loss(pred, target, weight=1.0, eps=1e-6):
+    """
+    反向MSE损失：让预测值与真实值尽可能不相似（通过最小化负的MSE实现）
+    :param pred: 预测动作 (batch, motor_dim)
+    :param target: 真实动作 (batch, motor_dim)
+    :param weight: 损失权重
+    :param eps: 防止除零
+    :return: 反向MSE损失值
+    """
+    mse = F.mse_loss(pred, target, reduction='mean')
+    # 核心逻辑：负的MSE → 优化器最小化该损失时，会让原始MSE最大化
+    reverse_loss = weight * (-mse)
+    return reverse_loss
+
+
 def train_one_epoch(epoch):
     """训练单个epoch"""
     image_embed.train()
@@ -192,6 +212,7 @@ def train_one_epoch(epoch):
 
     total_gen_loss = 0.0
     total_sim_loss = 0.0
+    total_reverse_mse_loss = 0.0  # 新增：记录反向MSE损失
     total_loss = 0.0
 
     max_train_batches = 20  # 限制训练批次（可根据需要调整）
@@ -242,7 +263,15 @@ def train_one_epoch(epoch):
         # 3. 相似度学习
         # 未来图像嵌入
         future_images_emb = image_embed(future_images)  # (batch, sim_seq_len, 2*embed_dim_gen)
-        img_proj = img_sim_model(future_images_emb)  # (batch, similarity_dim)
+        # 【修改2】接收双输出：相似度嵌入 + 预测电机动作
+        img_proj, img_motor_pred = img_sim_model(future_images_emb)  # (batch, similarity_dim), (batch, motor_dim)
+
+        # 【修改3】计算反向MSE损失（让预测动作远离真实动作）
+        reverse_mse_loss_val = reverse_mse_loss(
+            pred=img_motor_pred,
+            target=next_driver,
+            weight=config["reverse_mse_weight"]
+        )
 
         # 均值动作作为正样本
         mean_action = mean.unsqueeze(1)  # 增加时间维度 (batch, 1, 2)
@@ -260,29 +289,32 @@ def train_one_epoch(epoch):
         # 计算相似度损失
         sim_loss = info_ce_loss(img_proj, candidate_projections)
 
-        # 总损失
-        loss = gen_loss + sim_loss
+        # 【修改4】总损失 = 生成损失 + 相似度损失 + 反向MSE损失
+        loss = gen_loss + sim_loss + reverse_mse_loss_val
         loss.backward()
         optimizer.step()
 
         # 累计损失
         total_gen_loss += gen_loss.item()
         total_sim_loss += sim_loss.item()
+        total_reverse_mse_loss += reverse_mse_loss_val.item()  # 新增
         total_loss += loss.item()
 
-        # 更新进度条
+        # 更新进度条（新增反向MSE损失显示）
         pbar.set_postfix({
             "总损失": f"{loss.item():.4f}",
             "生成损失": f"{gen_loss.item():.4f}",
-            "相似度损失": f"{sim_loss.item():.4f}"
+            "相似度损失": f"{sim_loss.item():.4f}",
+            "反向MSE损失": f"{reverse_mse_loss_val.item():.4f}"  # 新增
         })
 
     # 计算平均损失
     avg_gen_loss = total_gen_loss / min(max_train_batches, len(train_loader))
     avg_sim_loss = total_sim_loss / min(max_train_batches, len(train_loader))
+    avg_reverse_mse_loss = total_reverse_mse_loss / min(max_train_batches, len(train_loader))  # 新增
     avg_total_loss = total_loss / min(max_train_batches, len(train_loader))
 
-    return avg_total_loss, avg_gen_loss, avg_sim_loss
+    return avg_total_loss, avg_gen_loss, avg_sim_loss, avg_reverse_mse_loss  # 新增返回值
 
 
 def validate_one_epoch(epoch):
@@ -295,6 +327,7 @@ def validate_one_epoch(epoch):
 
     total_gen_loss = 0.0
     total_sim_loss = 0.0
+    total_reverse_mse_loss = 0.0  # 新增
     total_loss = 0.0
 
     max_val_batches = 20  # 限制验证批次
@@ -340,7 +373,15 @@ def validate_one_epoch(epoch):
 
             # 相似度损失
             future_image_embedded = image_embed(future_images)
-            img_proj = img_sim_model(future_image_embedded)
+            # 【修改5】验证阶段同样接收双输出
+            img_proj, img_motor_pred = img_sim_model(future_image_embedded)
+
+            # 【修改6】验证阶段计算反向MSE损失
+            reverse_mse_loss_val = reverse_mse_loss(
+                pred=img_motor_pred,
+                target=next_driver,
+                weight=config["reverse_mse_weight"]
+            )
 
             # 均值动作作为正样本
             mean_action = mean.unsqueeze(1)
@@ -356,24 +397,30 @@ def validate_one_epoch(epoch):
 
             sim_loss = info_ce_loss(img_proj, candidate_projections)
 
+            # 【修改7】验证总损失同样包含反向MSE损失
+            total_batch_loss = gen_loss + sim_loss + reverse_mse_loss_val
+
             # 累计损失
-            total_batch_loss = gen_loss + sim_loss
             total_gen_loss += gen_loss.item()
             total_sim_loss += sim_loss.item()
+            total_reverse_mse_loss += reverse_mse_loss_val.item()  # 新增
             total_loss += total_batch_loss.item()
 
-            # 进度条显示
+            # 进度条显示（新增反向MSE损失）
             pbar.set_postfix({
                 "验证总损失": f"{total_batch_loss.item():.4f}",
                 "验证生成损失": f"{gen_loss.item():.4f}",
-                "验证相似度损失": f"{sim_loss.item():.4f}"
+                "验证相似度损失": f"{sim_loss.item():.4f}",
+                "验证反向MSE损失": f"{reverse_mse_loss_val.item():.4f}"  # 新增
             })
 
     # 计算平均损失
     avg_gen_loss = total_gen_loss / min(max_val_batches, len(val_loader))
     avg_sim_loss = total_sim_loss / min(max_val_batches, len(val_loader))
+    avg_reverse_mse_loss = total_reverse_mse_loss / min(max_val_batches, len(val_loader))  # 新增
     avg_total_loss = total_loss / min(max_val_batches, len(val_loader))
-    return avg_total_loss, avg_gen_loss, avg_sim_loss
+
+    return avg_total_loss, avg_gen_loss, avg_sim_loss, avg_reverse_mse_loss  # 新增返回值
 
 
 def main():
@@ -381,44 +428,49 @@ def main():
     print("=" * 50)
     print("开始训练（含验证集评估）")
     print(f"总epoch数：{config['epochs']} | 批量大小：{config['batch_size']} | 设备：{device}")
+    print(f"反向MSE损失权重：{config['reverse_mse_weight']}")
     print(f"loss数据保存目录：{config['loss_data_path']}")
     print("=" * 50)
 
-    # 记录损失
+    # 【修改8】更新损失记录字典，新增反向MSE损失项
     loss_records = {
-        "train_total": [], "train_gen": [], "train_sim": [],
-        "val_total": [], "val_gen": [], "val_sim": []
+        "train_total": [], "train_gen": [], "train_sim": [], "train_reverse_mse": [],
+        "val_total": [], "val_gen": [], "val_sim": [], "val_reverse_mse": []
     }
 
     for epoch in range(config["epochs"]):
         epoch_start_time = time.time()
 
-        # 训练
-        train_total, train_gen, train_sim = train_one_epoch(epoch)
+        # 训练（接收新增的反向MSE损失返回值）
+        train_total, train_gen, train_sim, train_reverse_mse = train_one_epoch(epoch)
         # 学习率调度
         sch.step()
-        # 验证
-        val_total, val_gen, val_sim = validate_one_epoch(epoch)
+        # 验证（接收新增的反向MSE损失返回值）
+        val_total, val_gen, val_sim, val_reverse_mse = validate_one_epoch(epoch)
 
         # 计算epoch耗时
         epoch_time = time.time() - epoch_start_time
 
-        # 记录损失
+        # 【修改9】记录反向MSE损失
         loss_records["train_total"].append(train_total)
         loss_records["train_gen"].append(train_gen)
         loss_records["train_sim"].append(train_sim)
+        loss_records["train_reverse_mse"].append(train_reverse_mse)  # 新增
         loss_records["val_total"].append(val_total)
         loss_records["val_gen"].append(val_gen)
         loss_records["val_sim"].append(val_sim)
+        loss_records["val_reverse_mse"].append(val_reverse_mse)  # 新增
 
-        # 打印epoch信息
+        # 打印epoch信息（新增反向MSE损失显示）
         print("\n" + "=" * 30)
         print(f"Epoch {epoch + 1}/{config['epochs']} | 耗时：{epoch_time:.2f}秒")
-        print(f"【训练集】总损失：{train_total:.4f} | 生成损失：{train_gen:.4f} | 相似度损失：{train_sim:.4f}")
-        print(f"【验证集】总损失：{val_total:.4f} | 生成损失：{val_gen:.4f} | 相似度损失：{val_sim:.4f}")
+        print(
+            f"【训练集】总损失：{train_total:.4f} | 生成损失：{train_gen:.4f} | 相似度损失：{train_sim:.4f} | 反向MSE损失：{train_reverse_mse:.4f}")
+        print(
+            f"【验证集】总损失：{val_total:.4f} | 生成损失：{val_gen:.4f} | 相似度损失：{val_sim:.4f} | 反向MSE损失：{val_reverse_mse:.4f}")
         print("=" * 30 + "\n")
 
-        # 保存最佳模型
+        # 保存最佳模型（逻辑不变，总损失已包含反向MSE）
         if val_total < best_val_loss:
             best_val_loss = val_total
             best_model_path = os.path.join(config["save_path"], "best_model")
@@ -439,7 +491,7 @@ def main():
 
             print(f"✅ 保存最佳模型（验证总损失：{best_val_loss:.4f}）至：{best_model_path}")
 
-    # 保存损失记录
+    # 保存损失记录（包含反向MSE损失）
     loss_save_path = os.path.join(config["loss_data_path"], "loss_records.npy")
     np.save(loss_save_path, loss_records)
 
