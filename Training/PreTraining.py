@@ -30,7 +30,7 @@ print(f"使用设备: {device}")
 # 配置参数
 config = {
     # 训练参数
-    "batch_size": 8,
+    "batch_size": 4,
     "epochs": 100,
     "lr": 5e-5,
     "sampling_workers": 20,
