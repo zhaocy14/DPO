@@ -46,7 +46,7 @@ CONFIG = {
     "action_match_tolerance": 1e-4,
 
     # 重复动作检测（原逻辑）
-    "repeat_threshold": 0.99,
+    "repeat_threshold": 0.999,
     "history_cache_size": 1,
 
     # 模型架构参数（适配Models.py）
