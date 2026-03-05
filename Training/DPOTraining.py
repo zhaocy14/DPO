@@ -41,7 +41,7 @@ CONFIG = {
     "val_batch_size": 6,
 
     # DPO核心参数（原逻辑）
-    "dpo_beta": 0.5,
+    "dpo_beta": 0.1,
     "alpha": 0.0,  # 相似度加权系数
     "action_match_tolerance": 1e-4,
 
@@ -282,80 +282,77 @@ def select_preferred_rejected(candidates: list[torch.Tensor],
                               motor_embed: MotorEmbedding,
                               driver_sim_model: SimilarityModelDriver,
                               batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """选择偏好/非偏好动作（修复维度不匹配+元组+梯度bug）"""
-    # ========== 核心修复：挤压候选动作的多余维度（解决[1,1,2]→[1,2]） ==========
-    processed_candidates = []
-    for cand in candidates:
-        # 挤压所有长度为1的维度，确保最终维度是(batch_size, motor_dim)
-        cand_processed = cand.squeeze()
-        # 防止挤压后变成一维（比如batch_size=1时），强制保留二维
-        if len(cand_processed.shape) == 1:
-            cand_processed = cand_processed.unsqueeze(0)
-        processed_candidates.append(cand_processed)
-    candidates = processed_candidates
-    # ==========================================================================
+    """选择偏好/非偏好动作（适配原始维度 (B,1,2)，不过度squeeze）"""
 
-    # 1. 维度检查（适配处理后的候选动作）
+    # 处理img_proj_future为元组的情况
+    if isinstance(img_proj_future, tuple):
+        img_proj_future = img_proj_future[0]
+
+    # 维度检查：候选动作保持原始维度 (B, 1, 2)
     assert len(candidates) == CONFIG["num_candidates"], f"候选数={len(candidates)}，需为{CONFIG['num_candidates']}"
     for i, cand in enumerate(candidates):
-        assert cand.shape == (batch_size, CONFIG["motor_dim"]), \
-            f"候选{i}维度错误：{cand.shape}，需为({batch_size},{CONFIG['motor_dim']})"
+        # 期望维度: (batch_size, 1, motor_dim)
+        assert cand.shape == (batch_size, 1, CONFIG["motor_dim"]), \
+            f"候选{i}维度错误：{cand.shape}，需为({batch_size},1,{CONFIG['motor_dim']})"
+
     assert future_driver_last.shape == (batch_size, CONFIG["motor_dim"]), \
         f"future_driver_last维度错误：{future_driver_last.shape}"
 
-    # 核心修复：处理img_proj_future为元组的情况
-    if isinstance(img_proj_future, tuple):
-        img_proj_future = img_proj_future[0]
-    # ==============================================================
-
-    # 2. 候选动作嵌入
+    # 1. 候选动作嵌入 (B, 1, 2) -> (B, 1, embed_dim)
     candidate_embeddings = []
     for cand in candidates:
-        cand_with_seq = cand.unsqueeze(1)  # (B,1,2)
-        emb = motor_embed(cand_with_seq)  # (B,1,128)
+        emb = motor_embed(cand)  # (B, 1, embed_dim_gen)
         candidate_embeddings.append(emb)
 
-    # 3. 计算图像相似度
+    # 2. 计算图像相似度
     sim_img = []
     for emb in candidate_embeddings:
-        cand_proj = driver_sim_model(emb).squeeze(1)  # (B,32)
-        img_proj_future_squeezed = img_proj_future.squeeze(1)  # (B,32) 现在可正常调用squeeze
-        sim = F.cosine_similarity(cand_proj, img_proj_future_squeezed, dim=1)  # (B,)
+        # 候选动作投影到similarity_dim空间
+        cand_proj = driver_sim_model(emb).squeeze(1)  # (B, similarity_dim)
+        # 未来图像特征
+        img_proj_squeezed = img_proj_future.squeeze(1)  # (B, similarity_dim)
+        # 余弦相似度
+        sim = F.cosine_similarity(cand_proj, img_proj_squeezed, dim=1)  # (B,)
         sim_img.append(sim)
 
-    # 4. 计算动作相似度
-    future_driver_with_seq = future_driver_last.unsqueeze(1)  # (B,1,2)
-    future_driver_emb = motor_embed(future_driver_with_seq)  # (B,1,128)
-    future_emb_squeezed = future_driver_emb.squeeze(1)  # (B,128)
-    future_norm = F.normalize(future_emb_squeezed, dim=1)  # (B,128)
+    # 3. 计算动作相似度
+    # 真实未来动作嵌入
+    future_driver_seq = future_driver_last.unsqueeze(1)  # (B, 1, 2)
+    future_driver_emb = motor_embed(future_driver_seq)  # (B, 1, embed_dim_gen)
+    future_emb_squeezed = future_driver_emb.squeeze(1)  # (B, embed_dim_gen)
+    future_norm = F.normalize(future_emb_squeezed, dim=1)  # (B, embed_dim_gen)
 
     sim_driver = []
     for emb in candidate_embeddings:
-        emb_squeezed = emb.squeeze(1)  # (B,128)
-        emb_norm = F.normalize(emb_squeezed, dim=1)  # (B,128)
+        emb_squeezed = emb.squeeze(1)  # (B, embed_dim_gen)
+        emb_norm = F.normalize(emb_squeezed, dim=1)  # (B, embed_dim_gen)
         sim = F.cosine_similarity(emb_norm, future_norm, dim=1)  # (B,)
         sim_driver.append(sim)
 
-    # 5. 计算总相似度
+    # 4. 计算总相似度（加权融合）
     alpha = CONFIG["alpha"]
-    sim_img_tensor = torch.stack(sim_img).T  # (B, 5)
-    sim_driver_tensor = torch.stack(sim_driver).T  # (B, 5)
-    sim_total = alpha * sim_img_tensor + (1 - alpha) * sim_driver_tensor  # (B, 5)
+    sim_img_tensor = torch.stack(sim_img).T  # (B, num_candidates)
+    sim_driver_tensor = torch.stack(sim_driver).T  # (B, num_candidates)
+    sim_total = alpha * sim_img_tensor + (1 - alpha) * sim_driver_tensor  # (B, num_candidates)
 
-    # 6. 选择偏好/非偏好动作
+    # 5. 选择偏好/非偏好动作
     preferred_idx = sim_total.argmax(dim=1)  # (B,)
     rejected_idx = sim_total.argmin(dim=1)  # (B,)
 
-    # 7. 提取动作
-    candidates_tensor = torch.stack(candidates).permute(1, 0, 2)  # (B,5,2)
+    # 6. 提取动作 - 保持维度 (B, 1, 2) 然后squeeze到 (B, 2)
+    candidates_tensor = torch.stack(candidates).permute(1, 0, 2, 3)  # (B, num_candidates, 1, 2)
+
+    # Gather preferred: (B, 1, 1, 2) -> squeeze -> (B, 2)
     preferred = torch.gather(
         candidates_tensor, 1,
-        preferred_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, CONFIG["motor_dim"])
-    ).squeeze(1)  # (B,2)
+        preferred_idx.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, -1, 1, CONFIG["motor_dim"])
+    ).squeeze(1).squeeze(1)  # (B, 2)
+
+    # Gather rejected: (B, 1, 1, 2) -> squeeze -> (B, 2)
     rejected = torch.gather(
         candidates_tensor, 1,
-        rejected_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, CONFIG["motor_dim"])
-    ).squeeze(1)  # (B,2)
+        rejected_idx.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, -1, 1, CONFIG["motor_dim"])
+    ).squeeze(1).squeeze(1)  # (B, 2)
 
     return preferred, rejected, sim_total
 
@@ -365,21 +362,21 @@ def get_highest_prob_action(candidates: list[torch.Tensor],
                             motor_embedded: torch.Tensor,
                             policy_gen: EncoderOnlyCandidateGenerator) -> tuple[torch.Tensor, torch.Tensor]:
     """修复最高概率动作计算中的维度问题"""
-    # 先处理候选动作维度（和select_preferred_rejected保持一致）
+    # 候选动作已经是 (B, 1, 2)，需要squeeze到 (B, 2) 用于计算log_prob
     processed_candidates = []
     for cand in candidates:
-        cand_processed = cand.squeeze()
-        if len(cand_processed.shape) == 1:
-            cand_processed = cand_processed.unsqueeze(0)
+        # cand: (B, 1, 2) -> squeeze -> (B, 2)
+        cand_processed = cand.squeeze(1)  # 只squeeze第1维
         processed_candidates.append(cand_processed)
-    candidates = processed_candidates
+
+    candidates_for_logp = processed_candidates
 
     batch_size = image_embedded.shape[0]
     mean, std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)  # (B,2), (B,2)
 
     # 计算每个候选动作的概率
     candidate_logps = []
-    for cand in candidates:
+    for cand in candidates_for_logp:  # cand: (B, 2)
         log_prob = gaussian_log_prob(mean, std, cand)  # (B,)
         candidate_logps.append(log_prob)
 
@@ -387,11 +384,12 @@ def get_highest_prob_action(candidates: list[torch.Tensor],
     candidate_logps_tensor = torch.stack(candidate_logps).T  # (B, num_candidates)
     highest_prob_idx = candidate_logps_tensor.argmax(dim=1)  # (B,)
 
-    candidates_tensor = torch.stack(candidates).permute(1, 0, 2)  # (B,5,2)
+    # 从原始candidates中选择（保持维度一致性）
+    candidates_tensor = torch.stack(candidates).permute(1, 0, 2, 3)  # (B, 5, 1, 2)
     highest_prob_action = torch.gather(
         candidates_tensor, 1,
-        highest_prob_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, CONFIG["motor_dim"])
-    ).squeeze(1)  # (B,2)
+        highest_prob_idx.unsqueeze(1).unsqueeze(2).unsqueeze(3).expand(-1, -1, 1, CONFIG["motor_dim"])
+    ).squeeze(1).squeeze(1)  # (B, 2)
 
     return highest_prob_action, candidate_logps_tensor
 
@@ -459,19 +457,9 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
             motor_embedded=motor_embedded,
             num_candidates=CONFIG["num_candidates"]
         )
-        policy_candidates = policy_outputs['candidates']
+        policy_candidates = policy_outputs['candidates']  # list of (B, 1, 2)
 
-        # 3. 重复动作检测 + 选择偏好/非偏好动作
-        # 处理候选动作维度
-        processed_candidates = []
-        for cand in policy_candidates:
-            cand_processed = cand.squeeze()
-            if len(cand_processed.shape) == 1:
-                cand_processed = cand_processed.unsqueeze(0)
-            processed_candidates.append(cand_processed)
-        policy_candidates = processed_candidates
-
-        # 选择prefer/rejected动作
+        # 3. 选择偏好/非偏好动作（保持原始维度）
         preferred, rejected, _ = select_preferred_rejected(
             candidates=policy_candidates,
             img_proj_future=img_proj_future,
@@ -481,14 +469,13 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
             batch_size=batch_size
         )
 
-        # 4. 重复动作检测（补全截断的逻辑）
-        # 对preferred动作做重复检测（原逻辑）
+        # 4. 重复动作检测（对preferred动作）
         is_repeat = False
         if batch_size == 1:
             is_repeat = is_repeated_action(preferred)
         else:
             # 批量处理时逐个检测
-            repeat_flags = [is_repeated_action(preferred[i]) for i in range(batch_size)]
+            repeat_flags = [is_repeated_action(preferred[i:i + 1]) for i in range(batch_size)]
             is_repeat = any(repeat_flags)
 
         # 重复则跳过当前batch的反向传播（原逻辑）
@@ -587,15 +574,6 @@ def val_one_epoch(epoch, val_loader, models):
             )
             policy_candidates = policy_outputs['candidates']
 
-            # 处理候选动作维度
-            processed_candidates = []
-            for cand in policy_candidates:
-                cand_processed = cand.squeeze()
-                if len(cand_processed.shape) == 1:
-                    cand_processed = cand_processed.unsqueeze(0)
-                processed_candidates.append(cand_processed)
-            policy_candidates = processed_candidates
-
             # 3. 选择prefer/rejected动作 + 计算最高概率动作
             preferred, rejected, _ = select_preferred_rejected(
                 candidates=policy_candidates,
@@ -605,6 +583,7 @@ def val_one_epoch(epoch, val_loader, models):
                 driver_sim_model=driver_sim_model,
                 batch_size=batch_size
             )
+
             # 获取模型最高概率动作
             highest_prob_action, _ = get_highest_prob_action(
                 candidates=policy_candidates,
