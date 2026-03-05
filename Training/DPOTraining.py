@@ -497,16 +497,20 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
             batch_count += 1
             continue
 
-        # 5. 计算对数概率（policy + ref模型）
+        # 5. 计算对数概率（policy需要梯度，ref不需要梯度）
+        # Policy模型：需要梯度，必须在no_grad外面
+        policy_mean, policy_std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)
+
+        # Ref模型：冻结，不需要梯度
         with torch.no_grad():
-            # policy模型分布
-            policy_mean, policy_std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)
-            # ref模型分布
             ref_mean, ref_std = get_generator_distribution(ref_gen, image_embedded, motor_embedded)
 
-            # 计算logp
-            policy_chosen_logps = gaussian_log_prob(policy_mean, policy_std, preferred)
-            policy_rejected_logps = gaussian_log_prob(policy_mean, policy_std, rejected)
+        # 计算policy的logp（需要梯度）
+        policy_chosen_logps = gaussian_log_prob(policy_mean, policy_std, preferred)
+        policy_rejected_logps = gaussian_log_prob(policy_mean, policy_std, rejected)
+
+        # 计算ref的logp（不需要梯度）
+        with torch.no_grad():
             ref_chosen_logps = gaussian_log_prob(ref_mean, ref_std, preferred)
             ref_rejected_logps = gaussian_log_prob(ref_mean, ref_std, rejected)
 
