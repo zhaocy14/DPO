@@ -37,7 +37,7 @@ CONFIG = {
     "num_candidates": 5,
     "sampling_workers": 2,
     "max_train_samples_per_epoch": 1000,
-    "max_val_batches": 5,
+    "max_val_batches": 10,
     "val_batch_size": 6,
 
     # DPO核心参数（原逻辑）
@@ -199,7 +199,8 @@ def load_dataset():
         show=True
     )
     train_dataset = all_dataset.training_dataset
-    val_dataset = all_dataset.val_dataset
+    # val_dataset = all_dataset.val_dataset
+    val_dataset = all_dataset.training_dataset
     print(f"✅ 数据集加载完成 | 训练集：{len(train_dataset)} | 验证集：{len(val_dataset)}")
 
     # 数据加载器（原逻辑）
