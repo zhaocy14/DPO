@@ -46,7 +46,7 @@ CONFIG = {
     "action_match_tolerance": 1e-4,
 
     # 重复动作检测（原逻辑）
-    "repeat_threshold": 0.999,
+    "repeat_threshold": 0.97,
     "history_cache_size": 1,
 
     # 模型架构参数（适配Models.py）
@@ -266,8 +266,8 @@ def is_repeated_action(action: torch.Tensor) -> bool:
     action_np = action.detach().cpu().numpy()
     for hist_action in HISTORY_CACHE["actions"]:
         similarity = np.corrcoef(action_np.flatten(), hist_action.flatten())[0, 1]
-        # if similarity > CONFIG["repeat_threshold"]:
-        if similarity == 1:
+        if similarity > CONFIG["repeat_threshold"]:
+        # if similarity == 1:
             return True
 
     # 更新缓存（原逻辑）
