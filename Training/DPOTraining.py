@@ -47,7 +47,7 @@ CONFIG = {
 
     # 重复动作检测（原逻辑）
     "repeat_threshold": 0.95,
-    "history_cache_size": 1,
+    "history_cache_size": 5,
 
     # 模型架构参数（适配Models.py）
     "embed_dim_gen": 128,
