@@ -242,7 +242,7 @@ def load_dataset():
     return train_loader, val_loader
 
 
-# ---------------------- 3. 核心工具函数（修复所有bug） ----------------------
+# ---------------------- 3. 核心工具函数（修复所有bug，重点解决维度不匹配） ----------------------
 def gaussian_log_prob(mean: torch.Tensor, std: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
     """保留原高斯对数概率计算逻辑"""
     eps = 1e-6
@@ -290,8 +290,20 @@ def select_preferred_rejected(candidates: list[torch.Tensor],
                               motor_embed: MotorEmbedding,
                               driver_sim_model: SimilarityModelDriver,
                               batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """选择偏好/非偏好动作（修复img_proj_future为元组的bug）"""
-    # 1. 维度检查（适配单组候选）
+    """选择偏好/非偏好动作（修复维度不匹配+元组+梯度bug）"""
+    # ========== 核心修复：挤压候选动作的多余维度（解决[1,1,2]→[1,2]） ==========
+    processed_candidates = []
+    for cand in candidates:
+        # 挤压所有长度为1的维度，确保最终维度是(batch_size, motor_dim)
+        cand_processed = cand.squeeze()
+        # 防止挤压后变成一维（比如batch_size=1时），强制保留二维
+        if len(cand_processed.shape) == 1:
+            cand_processed = cand_processed.unsqueeze(0)
+        processed_candidates.append(cand_processed)
+    candidates = processed_candidates
+    # ==========================================================================
+
+    # 1. 维度检查（适配处理后的候选动作）
     assert len(candidates) == CONFIG["num_candidates"], f"候选数={len(candidates)}，需为{CONFIG['num_candidates']}"
     for i, cand in enumerate(candidates):
         assert cand.shape == (batch_size, CONFIG["motor_dim"]), \
@@ -360,7 +372,16 @@ def get_highest_prob_action(candidates: list[torch.Tensor],
                             image_embedded: torch.Tensor,
                             motor_embedded: torch.Tensor,
                             policy_gen: EncoderOnlyCandidateGenerator) -> tuple[torch.Tensor, torch.Tensor]:
-    """保留原最高概率动作计算逻辑"""
+    """修复最高概率动作计算中的维度问题"""
+    # 先处理候选动作维度（和select_preferred_rejected保持一致）
+    processed_candidates = []
+    for cand in candidates:
+        cand_processed = cand.squeeze()
+        if len(cand_processed.shape) == 1:
+            cand_processed = cand_processed.unsqueeze(0)
+        processed_candidates.append(cand_processed)
+    candidates = processed_candidates
+
     batch_size = image_embedded.shape[0]
     mean, std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)  # (B,2), (B,2)
 
@@ -446,10 +467,18 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
             motor_embedded=motor_embedded,
             num_candidates=CONFIG["num_candidates"]
         )
-        policy_candidates = policy_outputs['candidates']  # list[(B,2), ...]
+        policy_candidates = policy_outputs['candidates']  # list[(B,1,2), ...]
 
-        # 3. 重复动作检测（原逻辑）
-        candidates_mean = torch.stack(policy_candidates).mean(dim=0)  # (B,2)
+        # 3. 重复动作检测（先处理维度再检测）
+        # 先处理候选动作维度，再计算均值
+        processed_candidates = []
+        for cand in policy_candidates:
+            cand_processed = cand.squeeze()
+            if len(cand_processed.shape) == 1:
+                cand_processed = cand_processed.unsqueeze(0)
+            processed_candidates.append(cand_processed)
+        candidates_mean = torch.stack(processed_candidates).mean(dim=0)  # (B,2)
+
         if is_repeated_action(candidates_mean):
             print(f"⚠️ 跳过重复动作 | Epoch {epoch + 1} Batch {batch_idx}")
             continue
@@ -475,14 +504,22 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
 
         # 6. 计算Policy模型的对数概率
         policy_mean, policy_std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)
-        policy_chosen_logp = gaussian_log_prob(policy_mean, policy_std, preferred_action)  # (B,)
-        policy_rejected_logp = gaussian_log_prob(policy_mean, policy_std, rejected_action)  # (B,)
+        # 处理preferred/rejected动作维度（防止多余维度）
+        preferred_action_processed = preferred_action.squeeze()
+        if len(preferred_action_processed.shape) == 1:
+            preferred_action_processed = preferred_action_processed.unsqueeze(0)
+        rejected_action_processed = rejected_action.squeeze()
+        if len(rejected_action_processed.shape) == 1:
+            rejected_action_processed = rejected_action_processed.unsqueeze(0)
+
+        policy_chosen_logp = gaussian_log_prob(policy_mean, policy_std, preferred_action_processed)  # (B,)
+        policy_rejected_logp = gaussian_log_prob(policy_mean, policy_std, rejected_action_processed)  # (B,)
 
         # 7. 计算Reference模型的对数概率（冻结）
         with torch.no_grad():
             ref_mean, ref_std = get_generator_distribution(ref_gen, image_embedded, motor_embedded)
-            ref_chosen_logp = gaussian_log_prob(ref_mean, ref_std, preferred_action)  # (B,)
-            ref_rejected_logp = gaussian_log_prob(ref_mean, ref_std, rejected_action)  # (B,)
+            ref_chosen_logp = gaussian_log_prob(ref_mean, ref_std, preferred_action_processed)  # (B,)
+            ref_rejected_logp = gaussian_log_prob(ref_mean, ref_std, rejected_action_processed)  # (B,)
 
         # 8. 计算DPO损失
         loss = dpo_loss(
@@ -500,11 +537,12 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
         # ---------------------- 核心：记录所有训练数据（原DPOTraining完整记录） ----------------------
         # 记录损失
         TRAIN_RECORDS["train"]["loss"]["batch"].append(loss.item())
-        # 记录动作（转numpy时添加detach()，避免潜在的梯度问题）
-        candidates_tensor = torch.stack(policy_candidates).permute(1, 0, 2).detach().cpu().numpy()  # (B,5,2)
+        # 记录动作（转numpy时添加detach()，并处理维度）
+        processed_candidates_np = [c.detach().cpu().numpy().squeeze() for c in policy_candidates]
+        candidates_tensor = np.stack(processed_candidates_np).transpose(1, 0, 2)  # (B,5,2)
         TRAIN_RECORDS["train"]["action"]["candidates"].append(candidates_tensor)
-        TRAIN_RECORDS["train"]["action"]["preferred"].append(preferred_action.detach().cpu().numpy())
-        TRAIN_RECORDS["train"]["action"]["rejected"].append(rejected_action.detach().cpu().numpy())
+        TRAIN_RECORDS["train"]["action"]["preferred"].append(preferred_action_processed.detach().cpu().numpy())
+        TRAIN_RECORDS["train"]["action"]["rejected"].append(rejected_action_processed.detach().cpu().numpy())
         TRAIN_RECORDS["train"]["action"]["highest_prob"].append(highest_prob_action.detach().cpu().numpy())
         # 记录相似度
         TRAIN_RECORDS["train"]["similarity"]["img"].append(sim_total[:, :].detach().cpu().numpy())  # 兼容原记录逻辑
@@ -586,14 +624,22 @@ def validate_full(epoch, val_loader, models):
                 batch_size=batch_size
             )
 
+            # 处理动作维度（防止多余维度）
+            preferred_action_processed = preferred_action.squeeze()
+            if len(preferred_action_processed.shape) == 1:
+                preferred_action_processed = preferred_action_processed.unsqueeze(0)
+            rejected_action_processed = rejected_action.squeeze()
+            if len(rejected_action_processed.shape) == 1:
+                rejected_action_processed = rejected_action_processed.unsqueeze(0)
+
             # 4. 计算对数概率
             policy_mean, policy_std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)
-            policy_chosen_logp = gaussian_log_prob(policy_mean, policy_std, preferred_action)
-            policy_rejected_logp = gaussian_log_prob(policy_mean, policy_std, rejected_action)
+            policy_chosen_logp = gaussian_log_prob(policy_mean, policy_std, preferred_action_processed)
+            policy_rejected_logp = gaussian_log_prob(policy_mean, policy_std, rejected_action_processed)
 
             ref_mean, ref_std = get_generator_distribution(ref_gen, image_embedded, motor_embedded)
-            ref_chosen_logp = gaussian_log_prob(ref_mean, ref_std, preferred_action)
-            ref_rejected_logp = gaussian_log_prob(ref_mean, ref_std, rejected_action)
+            ref_chosen_logp = gaussian_log_prob(ref_mean, ref_std, preferred_action_processed)
+            ref_rejected_logp = gaussian_log_prob(ref_mean, ref_std, rejected_action_processed)
 
             # 5. 计算损失
             loss = dpo_loss(
@@ -605,10 +651,11 @@ def validate_full(epoch, val_loader, models):
 
             # ---------------------- 记录所有验证数据（原DPOTraining完整记录） ----------------------
             TRAIN_RECORDS["val"]["loss"]["batch"].append(loss.item())
-            candidates_tensor = torch.stack(policy_candidates).permute(1, 0, 2).cpu().numpy()
+            processed_candidates_np = [c.cpu().numpy().squeeze() for c in policy_candidates]
+            candidates_tensor = np.stack(processed_candidates_np).transpose(1, 0, 2)  # (B,5,2)
             TRAIN_RECORDS["val"]["action"]["candidates"].append(candidates_tensor)
-            TRAIN_RECORDS["val"]["action"]["preferred"].append(preferred_action.cpu().numpy())
-            TRAIN_RECORDS["val"]["action"]["rejected"].append(rejected_action.cpu().numpy())
+            TRAIN_RECORDS["val"]["action"]["preferred"].append(preferred_action_processed.cpu().numpy())
+            TRAIN_RECORDS["val"]["action"]["rejected"].append(rejected_action_processed.cpu().numpy())
             # 计算最高概率动作用于记录
             highest_prob_action, _ = get_highest_prob_action(
                 candidates=policy_candidates,
