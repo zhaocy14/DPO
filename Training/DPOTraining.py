@@ -36,7 +36,7 @@ CONFIG = {
     # 候选动作生成（原逻辑）
     "num_candidates": 5,
     "sampling_workers": 2,
-    "max_train_samples_per_epoch": 500,
+    "max_train_samples_per_epoch": 1000,
     "max_val_batches": 5,
     "val_batch_size": 6,
 
@@ -46,7 +46,7 @@ CONFIG = {
     "action_match_tolerance": 1e-4,
 
     # 重复动作检测（原逻辑）
-    "repeat_threshold": 0.97,
+    "repeat_threshold": 0.95,
     "history_cache_size": 1,
 
     # 模型架构参数（适配Models.py）
@@ -481,7 +481,7 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
 
         # 重复则跳过当前batch的反向传播（原逻辑）
         if is_repeat:
-            print(f"\n⚠️ Batch {batch_idx} 检测到重复动作，跳过优化")
+            # print(f"\n⚠️ Batch {batch_idx} 检测到重复动作，跳过优化")
             batch_count += 1
             continue
 
