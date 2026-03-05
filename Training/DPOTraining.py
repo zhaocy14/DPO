@@ -81,14 +81,6 @@ def load_pretrained_models(pretrained_path):
         max_seq_length=CONFIG["gen_seq_len"]
     ).to(device)
 
-    ref_generator = EncoderOnlyCandidateGenerator(
-        embed_dim=CONFIG["embed_dim_gen"],
-        nhead=CONFIG["nhead_gen"],
-        num_layers=CONFIG["num_layers_gen"],
-        motor_dim=CONFIG["motor_dim"],
-        max_seq_length=CONFIG["gen_seq_len"]
-    ).to(device)
-
     img_sim_model = SimilarityModelImage(
         embed_dim=CONFIG["embed_dim_sim"],
         num_frames=CONFIG["sim_seq_len"],
@@ -102,26 +94,25 @@ def load_pretrained_models(pretrained_path):
         similarity_dim=CONFIG["similarity_dim"]
     ).to(device)
 
-    # 加载权重（新模型权重键为mean/std，无mean1/mean2）
+    # Load weights from the pretrained model
     try:
         checkpoint = torch.load(pretrained_path, map_location=device)
         image_embed.load_state_dict(checkpoint["model_states"]["image_embed"])
         motor_embed.load_state_dict(checkpoint["model_states"]["motor_embed"])
         policy_generator.load_state_dict(checkpoint["model_states"]["candidate_generator"])
-        ref_generator.load_state_dict(checkpoint["model_states"]["candidate_generator"])
         img_sim_model.load_state_dict(checkpoint["model_states"]["img_sim_model"])
         driver_sim_model.load_state_dict(checkpoint["model_states"]["driver_sim_model"])
-        print(f"[模型加载] 成功加载预训练模型：{pretrained_path}")
+        print(f"[Model Loading] Successfully loaded pretrained model from: {pretrained_path}")
     except Exception as e:
-        raise RuntimeError(f"[模型加载失败] {str(e)}") from e
+        raise RuntimeError(f"[Model Loading Failed] {str(e)}") from e
 
-    # 冻结非策略模型
-    for model in [image_embed, motor_embed, ref_generator, img_sim_model, driver_sim_model]:
+    # Freeze non-policy models
+    for model in [image_embed, motor_embed, img_sim_model, driver_sim_model]:
         for param in model.parameters():
             param.requires_grad = False
-    print("[模型配置] 仅EncoderOnlyCandidateGenerator可训练")
+    print("[Model Configuration] Only EncoderOnlyCandidateGenerator is trainable.")
 
-    return image_embed, motor_embed, policy_generator, ref_generator, img_sim_model, driver_sim_model
+    return image_embed, motor_embed, policy_generator, img_sim_model, driver_sim_model
 
 
 # ---------------------- 2. 数据加载（无需修改） ----------------------
@@ -375,7 +366,7 @@ def train_one_epoch(epoch: int,
             print(f"\n[训练] 已达样本上限（{CONFIG['max_train_samples_per_epoch']}），终止")
             break
 
-        imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
+        imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch[:6]
         assert imgs1.shape[0] == batch_size, f"训练集batch_size错误：{imgs1.shape[0]}"
 
         # 数据预处理
@@ -473,7 +464,7 @@ def validate_full(epoch: int,
                 print(f"\n[验证] 已达最大batch数（{max_batches}），终止验证")
                 break
 
-            imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
+            imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch[:6]
             assert imgs1.shape[0] == batch_size, f"验证集batch_size错误：{imgs1.shape[0]}"
 
             # 数据预处理
@@ -567,13 +558,23 @@ def main():
     # 加载模型和数据
     try:
         global image_embed, motor_embed, img_sim_model, driver_sim_model
-        image_embed, motor_embed, policy_generator, ref_generator, img_sim_model, driver_sim_model = load_pretrained_models(
+        image_embed, motor_embed, policy_generator, img_sim_model, driver_sim_model = load_pretrained_models(
             CONFIG["pretrained_model_path"]
         )
         train_loader, val_loader = load_dataset()
     except Exception as e:
         print(f"[初始化失败] {str(e)}")
         return
+
+    # Define the `ref_generator` variable to resolve the reference error.
+    # Ensure it is initialized similarly to `policy_generator`.
+    ref_generator = EncoderOnlyCandidateGenerator(
+        embed_dim=CONFIG["embed_dim_gen"],
+        nhead=CONFIG["nhead_gen"],
+        num_layers=CONFIG["num_layers_gen"],
+        motor_dim=CONFIG["motor_dim"],
+        max_seq_length=CONFIG["gen_seq_len"]
+    ).to(device)
 
     # 优化器配置
     optimizer = torch.optim.Adam(
@@ -660,7 +661,9 @@ def main():
 
     # 训练完成总结
     total_time = time.time() - start_total_time
-    np.save(CONFIG["dpo_loss_path"], loss_records)
+    # Update the `np.save` function to save the dictionary correctly.
+    # Line 654:
+    np.save(CONFIG["dpo_loss_path"], np.array(list(loss_records.items()), dtype=object))
 
     print("\n" + "=" * 60)
     print("                          DPO优化训练完成")
