@@ -77,23 +77,15 @@ CONFIG = {
 os.makedirs(CONFIG["trajectory_save_root"], exist_ok=True)
 os.makedirs(os.path.dirname(CONFIG["dpo_model_save_path"]), exist_ok=True)
 
-# ---------------------- 全局轨迹记录容器（保留原逻辑，记录所有训练数据） ----------------------
-# 初始化全量轨迹记录（batch级粒度，原DPOTraining完整记录）
-TRAIN_RECORDS = {
-    "train": {
-        "loss": {"batch": [], "epoch": []},  # batch级+epoch级损失
-        "action": {"candidates": [], "preferred": [], "rejected": [], "highest_prob": []},  # 动作轨迹
-        "similarity": {"img": [], "driver": [], "total": []},  # 相似度轨迹
-        "logp": {"policy_chosen": [], "policy_rejected": [], "ref_chosen": [], "ref_rejected": []},  # logp轨迹
-        "meta": {"epoch": [], "batch_idx": [], "timestamp": []}  # 元信息
-    },
-    "val": {
-        "loss": {"batch": [], "epoch": []},
-        "action": {"candidates": [], "preferred": [], "rejected": [], "highest_prob": []},
-        "similarity": {"img": [], "driver": [], "total": []},
-        "logp": {"policy_chosen": [], "policy_rejected": [], "ref_chosen": [], "ref_rejected": []},
-        "meta": {"epoch": [], "batch_idx": [], "timestamp": []}
-    }
+# ---------------------- 简化的全局记录容器（仅保留指定字段） ----------------------
+loss_records = {
+    "train_loss": [],
+    "val_loss": [],
+    "train_optimized_samples": [],
+    "val_total_samples": [],
+    "val_prefer_matches_model": [],  # prefer与最高概率动作匹配次数
+    "val_match_rate": [],  # 匹配比例
+    "lr": []
 }
 
 # 历史动作缓存（保留原逻辑的重复动作检测）
@@ -248,7 +240,7 @@ def gaussian_log_prob(mean: torch.Tensor, std: torch.Tensor, action: torch.Tenso
     eps = 1e-6
     std = std + eps
     log_prob = -0.5 * torch.log(2 * torch.tensor(np.pi, device=CONFIG["device"])) - torch.log(std) - (
-                action - mean) ** 2 / (2 * std ** 2)
+            action - mean) ** 2 / (2 * std ** 2)
     return log_prob.sum(dim=-1)
 
 
@@ -420,20 +412,18 @@ def dpo_loss(policy_chosen_logps: torch.Tensor,
     return loss.mean()
 
 
-# ---------------------- 4. 训练/验证逻辑（保留原DPOTraining所有逻辑，完整记录） ----------------------
+# ---------------------- 4. 训练逻辑（简化记录，仅保留指定字段） ----------------------
 def train_one_epoch(epoch, train_loader, models, optimizer):
-    """保留原训练逻辑，完整记录所有batch级数据"""
+    """训练一个epoch，仅记录指定的训练字段"""
     image_embed, motor_embed, policy_gen, ref_gen, img_sim_model, driver_sim_model = models
     policy_gen.train()
-    image_embed.eval()
-    motor_embed.eval()
-    ref_gen.eval()
-    img_sim_model.eval()
-    driver_sim_model.eval()
+    # 冻结模型设为eval模式
+    for model in [image_embed, motor_embed, ref_gen, img_sim_model, driver_sim_model]:
+        model.eval()
 
     total_loss = 0.0
     batch_count = 0
-    optimized_samples = 0
+    optimized_samples = 0  # 累计优化样本数
     pbar = tqdm(
         enumerate(train_loader),
         desc=f"Train Epoch {epoch + 1}/{CONFIG['epochs']}",
@@ -446,20 +436,22 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
 
         # 解包数据（原逻辑）
         imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
-        images = torch.stack([imgs1, imgs2], dim=2).to(CONFIG["device"])  # (B, seq, 2, 3, H, W)
+        images = torch.stack([imgs1, imgs2], dim=2).to(CONFIG["device"])
         future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(CONFIG["device"])
         driver = driver.to(CONFIG["device"])
-        future_driver_last = future_driver[:, 0, :].to(CONFIG["device"])  # (B, 2)
+        future_driver_last = future_driver[:, 0, :].to(CONFIG["device"])
         batch_size = images.shape[0]
 
         optimizer.zero_grad()
 
         # 1. 特征嵌入（冻结模型的前向传播）
         with torch.no_grad():
-            image_embedded = image_embed(images)  # (B, seq, embed_dim)
-            motor_embedded = motor_embed(driver)  # (B, seq, embed_dim)
-            future_image_embedded = image_embed(future_images)  # (B, sim_seq, embed_dim)
-            img_proj_future = img_sim_model(future_image_embedded)  # 可能返回元组
+            image_embedded = image_embed(images)
+            motor_embedded = motor_embed(driver)
+            future_image_embedded = image_embed(future_images)
+            img_proj_future = img_sim_model(future_image_embedded)
+            if isinstance(img_proj_future, tuple):
+                img_proj_future = img_proj_future[0]
 
         # 2. 生成候选动作（policy模型）
         policy_outputs = policy_gen(
@@ -467,25 +459,20 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
             motor_embedded=motor_embedded,
             num_candidates=CONFIG["num_candidates"]
         )
-        policy_candidates = policy_outputs['candidates']  # list[(B,1,2), ...]
+        policy_candidates = policy_outputs['candidates']
 
-        # 3. 重复动作检测（先处理维度再检测）
-        # 先处理候选动作维度，再计算均值
+        # 3. 重复动作检测 + 选择偏好/非偏好动作
+        # 处理候选动作维度
         processed_candidates = []
         for cand in policy_candidates:
             cand_processed = cand.squeeze()
             if len(cand_processed.shape) == 1:
                 cand_processed = cand_processed.unsqueeze(0)
             processed_candidates.append(cand_processed)
-        candidates_mean = torch.stack(processed_candidates).mean(dim=0)  # (B,2)
+        policy_candidates = processed_candidates
 
-        if is_repeated_action(candidates_mean):
-            print(f"⚠️ 跳过重复动作 | Epoch {epoch + 1} Batch {batch_idx}")
-            continue
-        optimized_samples += 1
-
-        # 4. 选择偏好/非偏好动作
-        preferred_action, rejected_action, sim_total = select_preferred_rejected(
+        # 选择prefer/rejected动作
+        preferred, rejected, _ = select_preferred_rejected(
             candidates=policy_candidates,
             img_proj_future=img_proj_future,
             future_driver_last=future_driver_last,
@@ -494,93 +481,73 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
             batch_size=batch_size
         )
 
-        # 5. 计算最高概率动作
-        highest_prob_action, candidate_logps = get_highest_prob_action(
-            candidates=policy_candidates,
-            image_embedded=image_embedded,
-            motor_embedded=motor_embedded,
-            policy_gen=policy_gen
-        )
+        # 4. 重复动作检测（补全截断的逻辑）
+        # 对preferred动作做重复检测（原逻辑）
+        is_repeat = False
+        if batch_size == 1:
+            is_repeat = is_repeated_action(preferred)
+        else:
+            # 批量处理时逐个检测
+            repeat_flags = [is_repeated_action(preferred[i]) for i in range(batch_size)]
+            is_repeat = any(repeat_flags)
 
-        # 6. 计算Policy模型的对数概率
-        policy_mean, policy_std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)
-        # 处理preferred/rejected动作维度（防止多余维度）
-        preferred_action_processed = preferred_action.squeeze()
-        if len(preferred_action_processed.shape) == 1:
-            preferred_action_processed = preferred_action_processed.unsqueeze(0)
-        rejected_action_processed = rejected_action.squeeze()
-        if len(rejected_action_processed.shape) == 1:
-            rejected_action_processed = rejected_action_processed.unsqueeze(0)
+        # 重复则跳过当前batch的反向传播（原逻辑）
+        if is_repeat:
+            print(f"\n⚠️ Batch {batch_idx} 检测到重复动作，跳过优化")
+            batch_count += 1
+            continue
 
-        policy_chosen_logp = gaussian_log_prob(policy_mean, policy_std, preferred_action_processed)  # (B,)
-        policy_rejected_logp = gaussian_log_prob(policy_mean, policy_std, rejected_action_processed)  # (B,)
-
-        # 7. 计算Reference模型的对数概率（冻结）
+        # 5. 计算对数概率（policy + ref模型）
         with torch.no_grad():
+            # policy模型分布
+            policy_mean, policy_std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)
+            # ref模型分布
             ref_mean, ref_std = get_generator_distribution(ref_gen, image_embedded, motor_embedded)
-            ref_chosen_logp = gaussian_log_prob(ref_mean, ref_std, preferred_action_processed)  # (B,)
-            ref_rejected_logp = gaussian_log_prob(ref_mean, ref_std, rejected_action_processed)  # (B,)
 
-        # 8. 计算DPO损失
+            # 计算logp
+            policy_chosen_logps = gaussian_log_prob(policy_mean, policy_std, preferred)
+            policy_rejected_logps = gaussian_log_prob(policy_mean, policy_std, rejected)
+            ref_chosen_logps = gaussian_log_prob(ref_mean, ref_std, preferred)
+            ref_rejected_logps = gaussian_log_prob(ref_mean, ref_std, rejected)
+
+        # 6. 计算DPO损失并反向传播
         loss = dpo_loss(
-            policy_chosen_logps=policy_chosen_logp,
-            policy_rejected_logps=policy_rejected_logp,
-            ref_chosen_logps=ref_chosen_logp,
-            ref_rejected_logps=ref_rejected_logp
+            policy_chosen_logps, policy_rejected_logps,
+            ref_chosen_logps, ref_rejected_logps
         )
-
-        # 9. 反向传播与优化
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(policy_gen.parameters(), max_norm=CONFIG["grad_clip_norm"])  # 梯度裁剪
+        torch.nn.utils.clip_grad_norm_(policy_gen.parameters(), CONFIG["grad_clip_norm"])
         optimizer.step()
 
-        # ---------------------- 核心：记录所有训练数据（原DPOTraining完整记录） ----------------------
-        # 记录损失
-        TRAIN_RECORDS["train"]["loss"]["batch"].append(loss.item())
-        # 记录动作（转numpy时添加detach()，并处理维度）
-        processed_candidates_np = [c.detach().cpu().numpy().squeeze() for c in policy_candidates]
-        candidates_tensor = np.stack(processed_candidates_np).transpose(1, 0, 2)  # (B,5,2)
-        TRAIN_RECORDS["train"]["action"]["candidates"].append(candidates_tensor)
-        TRAIN_RECORDS["train"]["action"]["preferred"].append(preferred_action_processed.detach().cpu().numpy())
-        TRAIN_RECORDS["train"]["action"]["rejected"].append(rejected_action_processed.detach().cpu().numpy())
-        TRAIN_RECORDS["train"]["action"]["highest_prob"].append(highest_prob_action.detach().cpu().numpy())
-        # 记录相似度
-        TRAIN_RECORDS["train"]["similarity"]["img"].append(sim_total[:, :].detach().cpu().numpy())  # 兼容原记录逻辑
-        TRAIN_RECORDS["train"]["similarity"]["driver"].append(sim_total[:, :].detach().cpu().numpy())
-        TRAIN_RECORDS["train"]["similarity"]["total"].append(sim_total.detach().cpu().numpy())
-        # 记录对数概率
-        TRAIN_RECORDS["train"]["logp"]["policy_chosen"].append(policy_chosen_logp.detach().cpu().numpy())
-        TRAIN_RECORDS["train"]["logp"]["policy_rejected"].append(policy_rejected_logp.detach().cpu().numpy())
-        TRAIN_RECORDS["train"]["logp"]["ref_chosen"].append(ref_chosen_logp.detach().cpu().numpy())
-        TRAIN_RECORDS["train"]["logp"]["ref_rejected"].append(ref_rejected_logp.detach().cpu().numpy())
-        # 记录元信息
-        TRAIN_RECORDS["train"]["meta"]["epoch"].append(epoch)
-        TRAIN_RECORDS["train"]["meta"]["batch_idx"].append(batch_idx)
-        TRAIN_RECORDS["train"]["meta"]["timestamp"].append(time.time())
-
-        # 更新累计损失
-        total_loss += loss.item()
+        # 累计损失和样本数
+        total_loss += loss.item() * batch_size
+        optimized_samples += batch_size
         batch_count += 1
-        pbar.set_postfix({
-            "Loss": f"{loss.item():.4f}",
-            "Avg Loss": f"{total_loss / batch_count:.4f}",
-            "Optimized Samples": optimized_samples
-        })
 
-    # 记录epoch级损失
-    avg_epoch_loss = total_loss / max(batch_count, 1)
-    TRAIN_RECORDS["train"]["loss"]["epoch"].append(avg_epoch_loss)
-    print(f"✅ Train Epoch {epoch + 1} | Avg Loss: {avg_epoch_loss:.4f} | Optimized Samples: {optimized_samples}")
-    return avg_epoch_loss, optimized_samples
+        # 更新进度条
+        pbar.set_postfix({"train_loss": loss.item(), "optimized_samples": optimized_samples})
+
+    # ---------------------- 记录当前epoch的训练数据 ----------------------
+    epoch_avg_loss = total_loss / max(optimized_samples, 1)  # 防止除0
+    loss_records["train_loss"].append(epoch_avg_loss)
+    loss_records["train_optimized_samples"].append(optimized_samples)
+    loss_records["lr"].append(optimizer.param_groups[0]['lr'])  # 记录当前学习率
+
+    print(f"\nEpoch {epoch + 1} Train | Avg Loss: {epoch_avg_loss:.4f} | Optimized Samples: {optimized_samples}")
+    return epoch_avg_loss
 
 
-def validate_full(epoch, val_loader, models):
-    """保留原验证逻辑，完整记录所有验证数据"""
+# ---------------------- 5. 验证逻辑（简化记录，仅保留指定字段） ----------------------
+def val_one_epoch(epoch, val_loader, models):
+    """验证一个epoch，记录指定的验证字段"""
     image_embed, motor_embed, policy_gen, ref_gen, img_sim_model, driver_sim_model = models
-    policy_gen.eval()
+    # 所有模型设为eval
+    for model in [image_embed, motor_embed, policy_gen, ref_gen, img_sim_model, driver_sim_model]:
+        model.eval()
 
-    total_val_loss = 0.0
-    batch_count = 0
+    total_loss = 0.0
+    total_samples = 0
+    prefer_matches_model = 0  # prefer与最高概率动作匹配次数
     pbar = tqdm(
         enumerate(val_loader),
         desc=f"Val Epoch {epoch + 1}/{CONFIG['epochs']}",
@@ -589,10 +556,10 @@ def validate_full(epoch, val_loader, models):
 
     with torch.no_grad():
         for batch_idx, batch in pbar:
-            if batch_count >= CONFIG["max_val_batches"]:
+            if batch_idx >= CONFIG["max_val_batches"]:
                 break
 
-            # 解包数据（原逻辑）
+            # 解包数据（同训练逻辑）
             imgs1, imgs2, driver, future_imgs1, future_imgs2, future_driver = batch
             images = torch.stack([imgs1, imgs2], dim=2).to(CONFIG["device"])
             future_images = torch.stack([future_imgs1, future_imgs2], dim=2).to(CONFIG["device"])
@@ -604,7 +571,9 @@ def validate_full(epoch, val_loader, models):
             image_embedded = image_embed(images)
             motor_embedded = motor_embed(driver)
             future_image_embedded = image_embed(future_images)
-            img_proj_future = img_sim_model(future_image_embedded)  # 可能返回元组
+            img_proj_future = img_sim_model(future_image_embedded)
+            if isinstance(img_proj_future, tuple):
+                img_proj_future = img_proj_future[0]
 
             # 2. 生成候选动作
             policy_outputs = policy_gen(
@@ -614,8 +583,17 @@ def validate_full(epoch, val_loader, models):
             )
             policy_candidates = policy_outputs['candidates']
 
-            # 3. 选择偏好/非偏好动作
-            preferred_action, rejected_action, sim_total = select_preferred_rejected(
+            # 处理候选动作维度
+            processed_candidates = []
+            for cand in policy_candidates:
+                cand_processed = cand.squeeze()
+                if len(cand_processed.shape) == 1:
+                    cand_processed = cand_processed.unsqueeze(0)
+                processed_candidates.append(cand_processed)
+            policy_candidates = processed_candidates
+
+            # 3. 选择prefer/rejected动作 + 计算最高概率动作
+            preferred, rejected, _ = select_preferred_rejected(
                 candidates=policy_candidates,
                 img_proj_future=img_proj_future,
                 future_driver_last=future_driver_last,
@@ -623,212 +601,96 @@ def validate_full(epoch, val_loader, models):
                 driver_sim_model=driver_sim_model,
                 batch_size=batch_size
             )
-
-            # 处理动作维度（防止多余维度）
-            preferred_action_processed = preferred_action.squeeze()
-            if len(preferred_action_processed.shape) == 1:
-                preferred_action_processed = preferred_action_processed.unsqueeze(0)
-            rejected_action_processed = rejected_action.squeeze()
-            if len(rejected_action_processed.shape) == 1:
-                rejected_action_processed = rejected_action_processed.unsqueeze(0)
-
-            # 4. 计算对数概率
-            policy_mean, policy_std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)
-            policy_chosen_logp = gaussian_log_prob(policy_mean, policy_std, preferred_action_processed)
-            policy_rejected_logp = gaussian_log_prob(policy_mean, policy_std, rejected_action_processed)
-
-            ref_mean, ref_std = get_generator_distribution(ref_gen, image_embedded, motor_embedded)
-            ref_chosen_logp = gaussian_log_prob(ref_mean, ref_std, preferred_action_processed)
-            ref_rejected_logp = gaussian_log_prob(ref_mean, ref_std, rejected_action_processed)
-
-            # 5. 计算损失
-            loss = dpo_loss(
-                policy_chosen_logps=policy_chosen_logp,
-                policy_rejected_logps=policy_rejected_logp,
-                ref_chosen_logps=ref_chosen_logp,
-                ref_rejected_logps=ref_rejected_logp
-            )
-
-            # ---------------------- 记录所有验证数据（原DPOTraining完整记录） ----------------------
-            TRAIN_RECORDS["val"]["loss"]["batch"].append(loss.item())
-            processed_candidates_np = [c.cpu().numpy().squeeze() for c in policy_candidates]
-            candidates_tensor = np.stack(processed_candidates_np).transpose(1, 0, 2)  # (B,5,2)
-            TRAIN_RECORDS["val"]["action"]["candidates"].append(candidates_tensor)
-            TRAIN_RECORDS["val"]["action"]["preferred"].append(preferred_action_processed.cpu().numpy())
-            TRAIN_RECORDS["val"]["action"]["rejected"].append(rejected_action_processed.cpu().numpy())
-            # 计算最高概率动作用于记录
+            # 获取模型最高概率动作
             highest_prob_action, _ = get_highest_prob_action(
                 candidates=policy_candidates,
                 image_embedded=image_embedded,
                 motor_embedded=motor_embedded,
                 policy_gen=policy_gen
             )
-            TRAIN_RECORDS["val"]["action"]["highest_prob"].append(highest_prob_action.cpu().numpy())
-            # 记录相似度
-            TRAIN_RECORDS["val"]["similarity"]["img"].append(sim_total[:, :].cpu().numpy())
-            TRAIN_RECORDS["val"]["similarity"]["driver"].append(sim_total[:, :].cpu().numpy())
-            TRAIN_RECORDS["val"]["similarity"]["total"].append(sim_total.cpu().numpy())
-            # 记录对数概率
-            TRAIN_RECORDS["val"]["logp"]["policy_chosen"].append(policy_chosen_logp.cpu().numpy())
-            TRAIN_RECORDS["val"]["logp"]["policy_rejected"].append(policy_rejected_logp.cpu().numpy())
-            TRAIN_RECORDS["val"]["logp"]["ref_chosen"].append(ref_chosen_logp.cpu().numpy())
-            TRAIN_RECORDS["val"]["logp"]["ref_rejected"].append(ref_rejected_logp.cpu().numpy())
-            # 记录元信息
-            TRAIN_RECORDS["val"]["meta"]["epoch"].append(epoch)
-            TRAIN_RECORDS["val"]["meta"]["batch_idx"].append(batch_idx)
-            TRAIN_RECORDS["val"]["meta"]["timestamp"].append(time.time())
 
-            # 更新累计损失
-            total_val_loss += loss.item()
-            batch_count += 1
-            pbar.set_postfix({
-                "Val Loss": f"{loss.item():.4f}",
-                "Avg Val Loss": f"{total_val_loss / batch_count:.4f}"
-            })
+            # 4. 统计prefer与最高概率动作的匹配次数
+            # 按batch逐个样本比较（容忍微小误差）
+            match = torch.isclose(preferred, highest_prob_action, atol=CONFIG["action_match_tolerance"]).all(dim=1)
+            prefer_matches_model += match.sum().item()
 
-    # 记录epoch级验证损失
-    avg_epoch_val_loss = total_val_loss / max(batch_count, 1)
-    TRAIN_RECORDS["val"]["loss"]["epoch"].append(avg_epoch_val_loss)
-    print(f"✅ Val Epoch {epoch + 1} | Avg Loss: {avg_epoch_val_loss:.4f}")
-    return avg_epoch_val_loss
+            # 5. 计算DPO损失
+            policy_mean, policy_std = get_generator_distribution(policy_gen, image_embedded, motor_embedded)
+            ref_mean, ref_std = get_generator_distribution(ref_gen, image_embedded, motor_embedded)
 
+            policy_chosen_logps = gaussian_log_prob(policy_mean, policy_std, preferred)
+            policy_rejected_logps = gaussian_log_prob(policy_mean, policy_std, rejected)
+            ref_chosen_logps = gaussian_log_prob(ref_mean, ref_std, preferred)
+            ref_rejected_logps = gaussian_log_prob(ref_mean, ref_std, rejected)
 
-# ---------------------- 5. 保存逻辑（保留原DPOTraining所有保存逻辑） ----------------------
-def save_all_records():
-    """保存所有训练轨迹记录（原逻辑完整保留）"""
-    # 保存损失记录
-    np.save(CONFIG["loss_records_path"], {
-        "train_batch": TRAIN_RECORDS["train"]["loss"]["batch"],
-        "train_epoch": TRAIN_RECORDS["train"]["loss"]["epoch"],
-        "val_batch": TRAIN_RECORDS["val"]["loss"]["batch"],
-        "val_epoch": TRAIN_RECORDS["val"]["loss"]["epoch"]
-    })
-    print(f"✅ 损失记录已保存：{CONFIG['loss_records_path']}")
+            loss = dpo_loss(
+                policy_chosen_logps, policy_rejected_logps,
+                ref_chosen_logps, ref_rejected_logps
+            )
 
-    # 保存相似度记录
-    np.save(CONFIG["similarity_records_path"], {
-        "train_img": TRAIN_RECORDS["train"]["similarity"]["img"],
-        "train_driver": TRAIN_RECORDS["train"]["similarity"]["driver"],
-        "train_total": TRAIN_RECORDS["train"]["similarity"]["total"],
-        "val_img": TRAIN_RECORDS["val"]["similarity"]["img"],
-        "val_driver": TRAIN_RECORDS["val"]["similarity"]["driver"],
-        "val_total": TRAIN_RECORDS["val"]["similarity"]["total"]
-    })
-    print(f"✅ 相似度记录已保存：{CONFIG['similarity_records_path']}")
+            # 累计损失和样本数
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
 
-    # 保存对数概率记录
-    np.save(CONFIG["logp_records_path"], {
-        "train_policy_chosen": TRAIN_RECORDS["train"]["logp"]["policy_chosen"],
-        "train_policy_rejected": TRAIN_RECORDS["train"]["logp"]["policy_rejected"],
-        "train_ref_chosen": TRAIN_RECORDS["train"]["logp"]["ref_chosen"],
-        "train_ref_rejected": TRAIN_RECORDS["train"]["logp"]["ref_rejected"],
-        "val_policy_chosen": TRAIN_RECORDS["val"]["logp"]["policy_chosen"],
-        "val_policy_rejected": TRAIN_RECORDS["val"]["logp"]["policy_rejected"],
-        "val_ref_chosen": TRAIN_RECORDS["val"]["logp"]["ref_chosen"],
-        "val_ref_rejected": TRAIN_RECORDS["val"]["logp"]["ref_rejected"]
-    })
-    print(f"✅ 对数概率记录已保存：{CONFIG['logp_records_path']}")
+            # 更新进度条
+            pbar.set_postfix({"val_loss": loss.item(), "match_count": prefer_matches_model})
 
-    # 保存动作记录（转列表方便JSON保存）
-    action_records = {
-        "train": {
-            "candidates": [arr.tolist() for arr in TRAIN_RECORDS["train"]["action"]["candidates"]],
-            "preferred": [arr.tolist() for arr in TRAIN_RECORDS["train"]["action"]["preferred"]],
-            "rejected": [arr.tolist() for arr in TRAIN_RECORDS["train"]["action"]["rejected"]],
-            "highest_prob": [arr.tolist() for arr in TRAIN_RECORDS["train"]["action"]["highest_prob"]]
-        },
-        "val": {
-            "candidates": [arr.tolist() for arr in TRAIN_RECORDS["val"]["action"]["candidates"]],
-            "preferred": [arr.tolist() for arr in TRAIN_RECORDS["val"]["action"]["preferred"]],
-            "rejected": [arr.tolist() for arr in TRAIN_RECORDS["val"]["action"]["rejected"]],
-            "highest_prob": [arr.tolist() for arr in TRAIN_RECORDS["val"]["action"]["highest_prob"]]
-        }
-    }
-    with open(CONFIG["action_records_path"], "w") as f:
-        json.dump(action_records, f, indent=4)
-    print(f"✅ 动作记录已保存：{CONFIG['action_records_path']}")
+    # ---------------------- 记录当前epoch的验证数据 ----------------------
+    epoch_avg_loss = total_loss / max(total_samples, 1)
+    match_rate = prefer_matches_model / max(total_samples, 1)  # 匹配比例
+    loss_records["val_loss"].append(epoch_avg_loss)
+    loss_records["val_total_samples"].append(total_samples)
+    loss_records["val_prefer_matches_model"].append(prefer_matches_model)
+    loss_records["val_match_rate"].append(match_rate)
 
-    # 保存元信息
-    meta_records = {
-        "train": {
-            "epoch": TRAIN_RECORDS["train"]["meta"]["epoch"],
-            "batch_idx": TRAIN_RECORDS["train"]["meta"]["batch_idx"],
-            "timestamp": TRAIN_RECORDS["train"]["meta"]["timestamp"]
-        },
-        "val": {
-            "epoch": TRAIN_RECORDS["val"]["meta"]["epoch"],
-            "batch_idx": TRAIN_RECORDS["val"]["meta"]["batch_idx"],
-            "timestamp": TRAIN_RECORDS["val"]["meta"]["timestamp"]
-        },
-        "config": CONFIG  # 保存配置参数
-    }
-    with open(CONFIG["meta_records_path"], "w") as f:
-        json.dump(meta_records, f, indent=4)
-    print(f"✅ 元信息记录已保存：{CONFIG['meta_records_path']}")
+    print(f"Epoch {epoch + 1} Val | Avg Loss: {epoch_avg_loss:.4f} | Match Rate: {match_rate:.4f}")
+    return epoch_avg_loss
 
 
-def save_dpo_model(models, optimizer, epoch):
-    """保存DPO模型（保留原格式，仅适配新模型）"""
-    image_embed, motor_embed, policy_gen, ref_gen, img_sim_model, driver_sim_model = models
-    save_dict = {
-        "epoch": epoch,
-        "optimizer_state_dict": optimizer.state_dict(),
-        "train_losses": TRAIN_RECORDS["train"]["loss"]["epoch"],
-        "val_losses": TRAIN_RECORDS["val"]["loss"]["epoch"],
-        # 兼容PreTraining的保存格式（原逻辑）
-        "image_embed": image_embed.state_dict(),
-        "motor_embed": motor_embed.state_dict(),
-        "candidate_generator": policy_gen.state_dict(),
-        "img_sim_model": img_sim_model.state_dict(),
-        "driver_sim_model": driver_sim_model.state_dict()
-    }
-    torch.save(save_dict, CONFIG["dpo_model_save_path"])
-    print(f"✅ DPO模型已保存：{CONFIG['dpo_model_save_path']}")
-
-
-# ---------------------- 6. 主流程（保留原DPOTraining所有逻辑） ----------------------
+# ---------------------- 6. 主训练函数 ----------------------
 def main():
-    print("=" * 50)
-    print("🚀 启动DPOTraining（保留原逻辑+适配新模型+修复所有bug）")
-    print("=" * 50)
-
-    # 1. 加载预训练模型（适配新Models.py）
+    # 1. 加载模型和数据
     models = load_pretrained_models()
-    image_embed, motor_embed, policy_gen, ref_gen, img_sim_model, driver_sim_model = models
-
-    # 2. 加载数据集（保留原逻辑）
     train_loader, val_loader = load_dataset()
 
-    # 3. 初始化优化器（原逻辑）
+    # 2. 初始化优化器
     optimizer = torch.optim.AdamW(
-        params=policy_gen.parameters(),
+        models[2].parameters(),  # 仅优化policy_generator
         lr=CONFIG["lr"],
         weight_decay=CONFIG["weight_decay"]
     )
-    print("✅ 优化器初始化完成")
 
-    # 4. 训练循环（保留原逻辑）
+    # 3. 训练主循环
     best_val_loss = float('inf')
     for epoch in range(CONFIG["epochs"]):
-        print(f"\n📌 Epoch {epoch + 1}/{CONFIG['epochs']}")
-        # 训练
-        train_loss, optimized_samples = train_one_epoch(epoch, train_loader, models, optimizer)
-        # 验证
-        val_loss = validate_full(epoch, val_loader, models)
-        # 保存最优模型（原逻辑）
+        # 训练一个epoch
+        train_one_epoch(epoch, train_loader, models, optimizer)
+        # 验证一个epoch
+        val_loss = val_one_epoch(epoch, val_loader, models)
+
+        # 保存最优模型
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_dpo_model(models, optimizer, epoch)
-            print(f"🏆 保存最优模型 | 最佳验证损失：{best_val_loss:.4f}")
+            torch.save({
+                "epoch": epoch,
+                "policy_gen_state_dict": models[2].state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_val_loss": best_val_loss,
+                "loss_records": loss_records
+            }, CONFIG["dpo_model_save_path"])
+            print(f"✅ 保存最优模型（Val Loss: {best_val_loss:.4f}）")
 
-    # 5. 保存所有记录（原逻辑完整保留）
-    save_all_records()
-    # 保存最终模型
-    save_dpo_model(models, optimizer, CONFIG["epochs"])
+    # 4. 保存最终的loss_records到文件
+    # 保存为JSON（方便查看）+ NPY（方便后续数值分析）
+    with open(os.path.join(CONFIG["trajectory_save_root"], "loss_records.json"), "w") as f:
+        json.dump({
+            k: [float(vv) for vv in v] if isinstance(v, list) else v
+            for k, v in loss_records.items()
+        }, f, indent=4)
+    np.save(os.path.join(CONFIG["trajectory_save_root"], "loss_records.npy"), loss_records)
 
-    print("\n" + "=" * 50)
-    print("🎉 DPOTraining完成 | 所有记录已保存 | 所有Bug修复完成")
-    print("=" * 50)
+    print(f"\n📊 训练完成！记录已保存到 {CONFIG['trajectory_save_root']}")
+    print("最终记录：", loss_records)
 
 
 if __name__ == "__main__":
