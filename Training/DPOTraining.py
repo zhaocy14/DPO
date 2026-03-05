@@ -36,8 +36,8 @@ CONFIG = {
     # 候选动作生成（原逻辑）
     "num_candidates": 5,
     "sampling_workers": 2,
-    "max_train_samples_per_epoch": 100,
-    "max_val_batches": 20,
+    "max_train_samples_per_epoch": 200,
+    "max_val_batches": 50,
     "val_batch_size": 6,
 
     # DPO核心参数（原逻辑）
@@ -479,10 +479,10 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
             is_repeat = any(repeat_flags)
 
         # 重复则跳过当前batch的反向传播（原逻辑）
-        # if is_repeat:
-        #     print(f"\n⚠️ Batch {batch_idx} 检测到重复动作，跳过优化")
-        #     batch_count += 1
-        #     continue
+        if is_repeat:
+            print(f"\n⚠️ Batch {batch_idx} 检测到重复动作，跳过优化")
+            batch_count += 1
+            continue
 
         # 5. 计算对数概率（policy需要梯度，ref不需要梯度）
         # Policy模型：需要梯度，必须在no_grad外面
