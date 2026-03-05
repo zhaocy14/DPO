@@ -36,7 +36,7 @@ CONFIG = {
     # 候选动作生成（原逻辑）
     "num_candidates": 5,
     "sampling_workers": 2,
-    "max_train_samples_per_epoch": 200,
+    "max_train_samples_per_epoch": 500,
     "max_val_batches": 50,
     "val_batch_size": 6,
 
