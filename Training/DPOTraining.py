@@ -37,11 +37,11 @@ CONFIG = {
     "num_candidates": 5,
     "sampling_workers": 2,
     "max_train_samples_per_epoch": 500,
-    "max_val_batches": 50,
+    "max_val_batches": 5,
     "val_batch_size": 6,
 
     # DPO核心参数（原逻辑）
-    "dpo_beta": 0.1,
+    "dpo_beta": 0.3,
     "alpha": 0.9,  # 相似度加权系数
     "action_match_tolerance": 1e-4,
 
