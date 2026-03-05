@@ -41,7 +41,7 @@ CONFIG = {
     "val_batch_size": 6,
 
     # DPO核心参数（原逻辑）
-    "dpo_beta": 0.5,
+    "dpo_beta": 0.3,
     "alpha": 0.85,  # 相似度加权系数
     "action_match_tolerance": 1e-4,
 
