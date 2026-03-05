@@ -266,7 +266,8 @@ def is_repeated_action(action: torch.Tensor) -> bool:
     action_np = action.detach().cpu().numpy()
     for hist_action in HISTORY_CACHE["actions"]:
         similarity = np.corrcoef(action_np.flatten(), hist_action.flatten())[0, 1]
-        if similarity > CONFIG["repeat_threshold"]:
+        # if similarity > CONFIG["repeat_threshold"]:
+        if similarity == 1:
             return True
 
     # 更新缓存（原逻辑）
