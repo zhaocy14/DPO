@@ -63,7 +63,7 @@ CONFIG = {
 
     # 路径配置（仅适配PreTraining路径，保留原存储结构）
     "data_root_dirs": '/data/cyzhao/collector_cydpo/dpo_data',
-    "pretrained_model_path": "./saved_models/best_model",  # PreTraining训练好的模型路径
+    "pretrained_model_path": "./saved_models/best_model_cos_sim",  # PreTraining训练好的模型路径
     "dpo_model_save_path": "./saved_models/dpo_final_best_model",  # DPO模型保存路径
     "trajectory_save_root": "./trajectory_records",  # 全量轨迹记录根目录
     "loss_records_path": "./trajectory_records/loss_records.npy",  # 损失轨迹
