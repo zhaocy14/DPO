@@ -21,7 +21,7 @@ from Model.Models import (
     SimilarityModelDriver
 )
 
-# ---------------------- 核心配置（保留原DPOTraining所有配置项） ----------------------
+# ---------------------- 核心配置（更新模型路径+保留原所有配置项） ----------------------
 CONFIG = {
     # 设备配置
     "device": "cuda:1" if torch.cuda.is_available() else "cpu",
@@ -61,9 +61,9 @@ CONFIG = {
     "nhead_sim": 4,
     "similarity_dim": 32,
 
-    # 路径配置（仅适配PreTraining路径，保留原存储结构）
+    # 路径配置（更新预训练模型名为best_model_cos_sim）
     "data_root_dirs": '/data/cyzhao/collector_cydpo/dpo_data',
-    "pretrained_model_path": "./saved_models/best_model_cos_sim",  # PreTraining训练好的模型路径
+    "pretrained_model_path": "./saved_models/best_model_cos_sim",  # 改为best_model_cos_sim
     "dpo_model_save_path": "./saved_models/dpo_final_best_model",  # DPO模型保存路径
     "trajectory_save_root": "./trajectory_records",  # 全量轨迹记录根目录
     "loss_records_path": "./trajectory_records/loss_records.npy",  # 损失轨迹
@@ -242,7 +242,7 @@ def load_dataset():
     return train_loader, val_loader
 
 
-# ---------------------- 3. 核心工具函数（修复select_preferred_rejected函数bug） ----------------------
+# ---------------------- 3. 核心工具函数（修复所有bug） ----------------------
 def gaussian_log_prob(mean: torch.Tensor, std: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
     """保留原高斯对数概率计算逻辑"""
     eps = 1e-6
@@ -264,13 +264,14 @@ def get_generator_distribution(generator, image_embedded, motor_embedded):
 
 
 def is_repeated_action(action: torch.Tensor) -> bool:
-    """保留原重复动作检测逻辑"""
+    """修复RuntimeError：带梯度的张量转numpy前先detach()"""
     if not HISTORY_CACHE["actions"]:
-        HISTORY_CACHE["actions"].append(action.cpu().numpy())
+        # 修复1：detach()后再转numpy（关键）
+        HISTORY_CACHE["actions"].append(action.detach().cpu().numpy())
         return False
 
-    # 计算与历史动作的相似度（原逻辑）
-    action_np = action.cpu().numpy()
+    # 修复2：detach()后再转numpy（关键）
+    action_np = action.detach().cpu().numpy()
     for hist_action in HISTORY_CACHE["actions"]:
         similarity = np.corrcoef(action_np.flatten(), hist_action.flatten())[0, 1]
         if similarity > CONFIG["repeat_threshold"]:
@@ -298,8 +299,7 @@ def select_preferred_rejected(candidates: list[torch.Tensor],
     assert future_driver_last.shape == (batch_size, CONFIG["motor_dim"]), \
         f"future_driver_last维度错误：{future_driver_last.shape}"
 
-    # ========== 核心修复：处理img_proj_future为元组的情况 ==========
-    # 如果是元组，提取第一个元素（核心投影张量）
+    # 核心修复：处理img_proj_future为元组的情况
     if isinstance(img_proj_future, tuple):
         img_proj_future = img_proj_future[0]
     # ==============================================================
@@ -500,21 +500,21 @@ def train_one_epoch(epoch, train_loader, models, optimizer):
         # ---------------------- 核心：记录所有训练数据（原DPOTraining完整记录） ----------------------
         # 记录损失
         TRAIN_RECORDS["train"]["loss"]["batch"].append(loss.item())
-        # 记录动作（转numpy方便保存）
-        candidates_tensor = torch.stack(policy_candidates).permute(1, 0, 2).cpu().numpy()  # (B,5,2)
+        # 记录动作（转numpy时添加detach()，避免潜在的梯度问题）
+        candidates_tensor = torch.stack(policy_candidates).permute(1, 0, 2).detach().cpu().numpy()  # (B,5,2)
         TRAIN_RECORDS["train"]["action"]["candidates"].append(candidates_tensor)
-        TRAIN_RECORDS["train"]["action"]["preferred"].append(preferred_action.cpu().numpy())
-        TRAIN_RECORDS["train"]["action"]["rejected"].append(rejected_action.cpu().numpy())
-        TRAIN_RECORDS["train"]["action"]["highest_prob"].append(highest_prob_action.cpu().numpy())
+        TRAIN_RECORDS["train"]["action"]["preferred"].append(preferred_action.detach().cpu().numpy())
+        TRAIN_RECORDS["train"]["action"]["rejected"].append(rejected_action.detach().cpu().numpy())
+        TRAIN_RECORDS["train"]["action"]["highest_prob"].append(highest_prob_action.detach().cpu().numpy())
         # 记录相似度
-        TRAIN_RECORDS["train"]["similarity"]["img"].append(sim_total[:, :].cpu().numpy())  # 兼容原记录逻辑
-        TRAIN_RECORDS["train"]["similarity"]["driver"].append(sim_total[:, :].cpu().numpy())
-        TRAIN_RECORDS["train"]["similarity"]["total"].append(sim_total.cpu().numpy())
+        TRAIN_RECORDS["train"]["similarity"]["img"].append(sim_total[:, :].detach().cpu().numpy())  # 兼容原记录逻辑
+        TRAIN_RECORDS["train"]["similarity"]["driver"].append(sim_total[:, :].detach().cpu().numpy())
+        TRAIN_RECORDS["train"]["similarity"]["total"].append(sim_total.detach().cpu().numpy())
         # 记录对数概率
-        TRAIN_RECORDS["train"]["logp"]["policy_chosen"].append(policy_chosen_logp.cpu().numpy())
-        TRAIN_RECORDS["train"]["logp"]["policy_rejected"].append(policy_rejected_logp.cpu().numpy())
-        TRAIN_RECORDS["train"]["logp"]["ref_chosen"].append(ref_chosen_logp.cpu().numpy())
-        TRAIN_RECORDS["train"]["logp"]["ref_rejected"].append(ref_rejected_logp.cpu().numpy())
+        TRAIN_RECORDS["train"]["logp"]["policy_chosen"].append(policy_chosen_logp.detach().cpu().numpy())
+        TRAIN_RECORDS["train"]["logp"]["policy_rejected"].append(policy_rejected_logp.detach().cpu().numpy())
+        TRAIN_RECORDS["train"]["logp"]["ref_chosen"].append(ref_chosen_logp.detach().cpu().numpy())
+        TRAIN_RECORDS["train"]["logp"]["ref_rejected"].append(ref_rejected_logp.detach().cpu().numpy())
         # 记录元信息
         TRAIN_RECORDS["train"]["meta"]["epoch"].append(epoch)
         TRAIN_RECORDS["train"]["meta"]["batch_idx"].append(batch_idx)
@@ -742,7 +742,7 @@ def save_dpo_model(models, optimizer, epoch):
 # ---------------------- 6. 主流程（保留原DPOTraining所有逻辑） ----------------------
 def main():
     print("=" * 50)
-    print("🚀 启动DPOTraining（保留原逻辑+适配新模型+修复元组bug）")
+    print("🚀 启动DPOTraining（保留原逻辑+适配新模型+修复所有bug）")
     print("=" * 50)
 
     # 1. 加载预训练模型（适配新Models.py）
@@ -780,7 +780,7 @@ def main():
     save_dpo_model(models, optimizer, CONFIG["epochs"])
 
     print("\n" + "=" * 50)
-    print("🎉 DPOTraining完成 | 所有记录已保存 | Bug修复完成")
+    print("🎉 DPOTraining完成 | 所有记录已保存 | 所有Bug修复完成")
     print("=" * 50)
 
 
